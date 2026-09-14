@@ -41,16 +41,25 @@ tests/tmp-*
 *.pid
 *.lock
 
-# AI Assistant Instructions
-.claude/
-.agents/
+# Local AI Assistant Instructions
+# CLAUDE.md is a symlink to AGENTS.md (shared source of truth, tracked).
+# Personal overrides go in *.local.md, which stay gitignored.
+CLAUDE.local.md
+AGENTS.local.md
+AGENTS.override.md
+.claude/*
+!.claude/agents/
+!.claude/hooks/
+!.claude/skills/
+!.claude/settings.json
+.claude/settings.local.json
+.agents/settings.local.json
 .gemini/
 .kiro/
-CLAUDE.md
 GEMINI.md
 ANTIGRAVITY.md
 WARP.md
-AGENTS.md
+journal/
 .cursorrules
 
 # Go build artifacts (development)
@@ -77,6 +86,4 @@ coverage.html
 
 session.json
 run_tests.ps1
-AGENTS.md
 mole_guidelines.md
-CLAUDE.md
