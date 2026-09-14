@@ -15,29 +15,46 @@ const (
 	healthIOWeight      = 10.0
 
 	// CPU.
-	cpuNormalThreshold = 30.0
-	cpuHighThreshold   = 70.0
+	cpuNormalThreshold = 50.0
+	cpuHighThreshold   = 85.0
 
 	// Memory.
-	memNormalThreshold     = 50.0
-	memHighThreshold       = 80.0
+	memNormalThreshold     = 70.0
+	memHighThreshold       = 88.0
 	memPressureWarnPenalty = 5.0
 	memPressureCritPenalty = 15.0
 
 	// Disk.
-	diskWarnThreshold = 70.0
-	diskCritThreshold = 90.0
+	diskWarnThreshold = 80.0
+	diskCritThreshold = 93.0
 
 	// Thermal.
-	thermalNormalThreshold = 60.0
+	thermalNormalThreshold = 65.0
 	thermalHighThreshold   = 85.0
 
 	// Disk IO (MB/s).
 	ioNormalThreshold = 50.0
 	ioHighThreshold   = 150.0
+
+	// Battery.
+	batteryCycleWarn   = 800
+	batteryCycleDanger = 900
+	batteryCapWarn     = 80
+	batteryCapDanger   = 60
+
+	// Uptime (seconds).
+	uptimeWarnDays   = 7
+	uptimeDangerDays = 14
+	uptimeWarnSecs   = uptimeWarnDays * 86400
+	uptimeDangerSecs = uptimeDangerDays * 86400
+
+	// Score display bands (shared with view.go score styling).
+	scoreExcellentThreshold = 85
+	scoreGoodThreshold      = 65
+	scoreFairThreshold      = 45
 )
 
-func calculateHealthScore(cpu CPUStatus, mem MemoryStatus, disks []DiskStatus, diskIO DiskIOStatus, thermal ThermalStatus) (int, string) {
+func calculateHealthScore(cpu CPUStatus, mem MemoryStatus, disks []DiskStatus, diskIO DiskIOStatus, thermal ThermalStatus, batteries []BatteryStatus, uptimeSecs uint64) (int, string) {
 	score := 100.0
 	issues := []string{}
 
@@ -45,7 +62,11 @@ func calculateHealthScore(cpu CPUStatus, mem MemoryStatus, disks []DiskStatus, d
 	cpuPenalty := 0.0
 	if cpu.Usage > cpuNormalThreshold {
 		if cpu.Usage > cpuHighThreshold {
-			cpuPenalty = healthCPUWeight * (cpu.Usage - cpuNormalThreshold) / cpuHighThreshold
+			// Scale across the remaining range up to 100% so the penalty keeps
+			// growing with usage (matches the disk branch). Dividing by the raw
+			// high threshold instead made the penalty drop past 85%, letting the
+			// score rise as CPU load got worse.
+			cpuPenalty = healthCPUWeight * (cpu.Usage - cpuNormalThreshold) / (100 - cpuNormalThreshold)
 		} else {
 			cpuPenalty = (healthCPUWeight / 2) * (cpu.Usage - cpuNormalThreshold) / (cpuHighThreshold - cpuNormalThreshold)
 		}
@@ -59,7 +80,11 @@ func calculateHealthScore(cpu CPUStatus, mem MemoryStatus, disks []DiskStatus, d
 	memPenalty := 0.0
 	if mem.UsedPercent > memNormalThreshold {
 		if mem.UsedPercent > memHighThreshold {
-			memPenalty = healthMemWeight * (mem.UsedPercent - memNormalThreshold) / memNormalThreshold
+			// Scale across the remaining range up to 100% so the penalty keeps
+			// growing with usage (matches the disk branch). Dividing by the raw
+			// normal threshold instead made the penalty drop past 88%, letting
+			// the score rise as memory pressure got worse.
+			memPenalty = healthMemWeight * (mem.UsedPercent - memNormalThreshold) / (100 - memNormalThreshold)
 		} else {
 			memPenalty = (healthMemWeight / 2) * (mem.UsedPercent - memNormalThreshold) / (memHighThreshold - memNormalThreshold)
 		}
@@ -95,6 +120,15 @@ func calculateHealthScore(cpu CPUStatus, mem MemoryStatus, disks []DiskStatus, d
 			issues = append(issues, "Disk Almost Full")
 		}
 	}
+	for _, disk := range disks {
+		if disk.SmartStatus == smartStatusFailing {
+			if score > 44 {
+				score = 44
+			}
+			issues = append(issues, "Disk SMART Failing")
+			break
+		}
+	}
 
 	// Thermal penalty.
 	thermalPenalty := 0.0
@@ -123,6 +157,27 @@ func calculateHealthScore(cpu CPUStatus, mem MemoryStatus, disks []DiskStatus, d
 	}
 	score -= ioPenalty
 
+	// Battery health penalty (only when battery present).
+	if len(batteries) > 0 {
+		b := batteries[0]
+		_, sev := batteryHealthLabel(b.CycleCount, b.Capacity)
+		switch sev {
+		case "danger":
+			score -= 5
+			issues = append(issues, "Battery Service Soon")
+		case "warn":
+			score -= 2
+		}
+	}
+
+	// Uptime penalty (long uptime without restart).
+	if uptimeSecs > uptimeDangerSecs {
+		score -= 3
+		issues = append(issues, "Restart Recommended")
+	} else if uptimeSecs > uptimeWarnSecs {
+		score -= 1
+	}
+
 	// Clamp score.
 	if score < 0 {
 		score = 0
@@ -134,16 +189,14 @@ func calculateHealthScore(cpu CPUStatus, mem MemoryStatus, disks []DiskStatus, d
 	// Build message.
 	var msg string
 	switch {
-	case score >= 90:
+	case score >= scoreExcellentThreshold:
 		msg = "Excellent"
-	case score >= 75:
+	case score >= scoreGoodThreshold:
 		msg = "Good"
-	case score >= 60:
+	case score >= scoreFairThreshold:
 		msg = "Fair"
-	case score >= 40:
-		msg = "Poor"
 	default:
-		msg = "Critical"
+		msg = "Needs Attention"
 	}
 
 	if len(issues) > 0 {
@@ -151,6 +204,29 @@ func calculateHealthScore(cpu CPUStatus, mem MemoryStatus, disks []DiskStatus, d
 	}
 
 	return int(score), msg
+}
+
+// batteryHealthLabel returns a human-readable health label and severity based on cycle count and capacity.
+// Severity is "ok", "warn", or "danger".
+func batteryHealthLabel(cycles int, capacity int) (string, string) {
+	if cycles > batteryCycleDanger || (capacity > 0 && capacity < batteryCapDanger) {
+		return "Service Soon", "danger"
+	}
+	if cycles > batteryCycleWarn || (capacity > 0 && capacity < batteryCapWarn) {
+		return "Fair", "warn"
+	}
+	return "Healthy", "ok"
+}
+
+// uptimeSeverity returns "ok", "warn", or "danger" based on uptime seconds.
+func uptimeSeverity(secs uint64) string {
+	if secs > uptimeDangerSecs {
+		return "danger"
+	}
+	if secs > uptimeWarnSecs {
+		return "warn"
+	}
+	return "ok"
 }
 
 func formatUptime(secs uint64) string {

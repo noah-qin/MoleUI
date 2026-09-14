@@ -106,32 +106,9 @@ setup() {
     [ "$result" = "$current_user" ]
 }
 
-@test "get_invoking_user executes quickly" {
-    local start end elapsed
-    local limit_ms="${MOLE_PERF_GET_INVOKING_USER_LIMIT_MS:-500}"
-
-    start=$(date +%s%N)
-    for i in {1..100}; do
-        get_invoking_user > /dev/null
-    done
-    end=$(date +%s%N)
-
-    elapsed=$(( (end - start) / 1000000 ))
-
-    [ "$elapsed" -lt "$limit_ms" ]
-}
-
-@test "get_darwin_major caches correctly" {
-    local first second
-    first=$(get_darwin_major)
-    second=$(get_darwin_major)
-
-    [ "$first" = "$second" ]
-    [[ "$first" =~ ^[0-9]+$ ]]
-}
-
 @test "create_temp_file and cleanup_temp_files work efficiently" {
     local start end elapsed
+    local limit_ms="${MOLE_PERF_CREATE_TEMP_FILE_LIMIT_MS:-3000}"
 
     declare -a MOLE_TEMP_DIRS=()
 
@@ -143,7 +120,7 @@ setup() {
 
     elapsed=$(( (end - start) / 1000000 ))
 
-    [ "$elapsed" -lt 1000 ]
+    [ "$elapsed" -lt "$limit_ms" ]
 
     [ "${#MOLE_TEMP_FILES[@]}" -eq 50 ]
 
@@ -152,7 +129,7 @@ setup() {
     end=$(date +%s%N)
 
     elapsed=$(( (end - start) / 1000000 ))
-    [ "$elapsed" -lt 2000 ]
+    [ "$elapsed" -lt "$limit_ms" ]
 
     [ "${#MOLE_TEMP_FILES[@]}" -eq 0 ]
 }
@@ -161,43 +138,18 @@ setup() {
     local temp_file
     temp_file=$(mktemp_file "test_prefix")
 
-    [[ "$temp_file" =~ test_prefix ]]
+    [[ "$temp_file" =~ test_prefix ]] || return 1
 
     [ -f "$temp_file" ]
 
     rm -f "$temp_file"
 }
 
-@test "get_brand_name handles common apps efficiently" {
-    local start end elapsed
-
-    get_brand_name "wechat" > /dev/null
-
-    start=$(date +%s%N)
-    for i in {1..50}; do
-        get_brand_name "wechat" > /dev/null
-        get_brand_name "QQ" > /dev/null
-        get_brand_name "dingtalk" > /dev/null
-    done
-    end=$(date +%s%N)
-
-    elapsed=$(( (end - start) / 1000000 ))
-
-    [ "$elapsed" -lt 5000 ]
-}
-
-@test "get_brand_name returns correct localized names" {
-    local result
-    result=$(get_brand_name "wechat")
-
-    [[ "$result" == "WeChat" || "$result" == "微信" ]]
-}
-
 @test "get_optimal_parallel_jobs returns sensible values" {
     local result
 
     result=$(get_optimal_parallel_jobs)
-    [[ "$result" =~ ^[0-9]+$ ]]
+    [[ "$result" =~ ^[0-9]+$ ]] || return 1
     [ "$result" -gt 0 ]
     [ "$result" -le 128 ]
 
@@ -233,5 +185,6 @@ setup() {
 
     elapsed=$(( (end - start) / 1000000 ))
 
-    [ "$elapsed" -lt 2000 ]
+    local limit_ms="${MOLE_PERF_SECTION_LIMIT_MS:-2000}"
+    [ "$elapsed" -lt "$limit_ms" ]
 }

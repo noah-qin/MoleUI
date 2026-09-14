@@ -14,6 +14,7 @@ import (
 const (
 	systemProfilerTimeout = 4 * time.Second
 	macGPUInfoTTL         = 10 * time.Minute
+	macGPUUsageTTL        = 5 * time.Second
 	powermetricsTimeout   = 2 * time.Second
 )
 
@@ -35,7 +36,7 @@ func (c *Collector) collectGPU(now time.Time) ([]GPUStatus, error) {
 
 		// Real-time GPU usage.
 		if len(c.cachedGPU) > 0 {
-			usage := getMacGPUUsage()
+			usage := c.getMacGPUUsage(now)
 			result := make([]GPUStatus, len(c.cachedGPU))
 			copy(result, c.cachedGPU)
 			// Apply usage to first GPU (Apple Silicon).
@@ -149,6 +150,17 @@ func readMacGPUInfo() ([]GPUStatus, error) {
 	}
 
 	return gpus, nil
+}
+
+func (c *Collector) getMacGPUUsage(now time.Time) float64 {
+	if !c.lastGPUUsageAt.IsZero() && now.Sub(c.lastGPUUsageAt) < macGPUUsageTTL {
+		return c.cachedGPUUsage
+	}
+
+	usage := getMacGPUUsage()
+	c.cachedGPUUsage = usage
+	c.lastGPUUsageAt = now
+	return usage
 }
 
 // getMacGPUUsage reads GPU active residency from powermetrics.
