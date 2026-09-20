@@ -10,6 +10,24 @@ setup() {
     source "$PROJECT_ROOT/lib/core/sudo.sh"
 }
 
+@test "check_touchid_support falls back to legacy sudo when sudo_local is present" {
+    local pam_sudo="$BATS_TEST_TMPDIR/sudo"
+    local pam_sudo_local="$BATS_TEST_TMPDIR/sudo_local"
+
+    printf 'auth sufficient pam_tid.so\n' > "$pam_sudo"
+    printf 'auth include pam_opendirectory.so\n' > "$pam_sudo_local"
+    export MOLE_PAM_SUDO_FILE="$pam_sudo"
+    export MOLE_PAM_SUDO_LOCAL_FILE="$pam_sudo_local"
+
+    run check_touchid_support
+    [ "$status" -eq 0 ]
+
+    printf 'auth include pam_opendirectory.so\n' > "$pam_sudo"
+
+    run check_touchid_support
+    [ "$status" -eq 1 ]
+}
+
 @test "has_sudo_session returns 1 when no sudo session" {
     # shellcheck disable=SC2329
     sudo() { return 1; }
@@ -26,7 +44,7 @@ setup() {
     }
     export -f sudo
 
-    run bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; has_sudo_session"
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; has_sudo_session"
     [ "$status" -eq 1 ]  # Expected: no sudo session
 }
 
@@ -41,19 +59,19 @@ setup() {
     export -f sudo
 
     local pid
-    pid=$(bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; _start_sudo_keepalive")
+    pid=$(/bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; _start_sudo_keepalive")
 
-    [[ "$pid" =~ ^[0-9]+$ ]]
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
 
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
 }
 
 @test "_stop_sudo_keepalive handles invalid PID gracefully" {
-    run bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; _stop_sudo_keepalive ''"
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; _stop_sudo_keepalive ''"
     [ "$status" -eq 0 ]
 
-    run bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; _stop_sudo_keepalive '99999'"
+    run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; _stop_sudo_keepalive '99999'"
     [ "$status" -eq 0 ]
 }
 
@@ -62,11 +80,69 @@ setup() {
 @test "stop_sudo_session cleans up keepalive process" {
     export MOLE_SUDO_KEEPALIVE_PID="99999"
 
-    run bash -c "export MOLE_SUDO_KEEPALIVE_PID=99999; source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; stop_sudo_session"
+    run /bin/bash -c "export MOLE_SUDO_KEEPALIVE_PID=99999; source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; stop_sudo_session"
     [ "$status" -eq 0 ]
 }
 
 @test "sudo manager initializes global state correctly" {
-    result=$(bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; echo \$MOLE_SUDO_ESTABLISHED")
+    result=$(/bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; source '$PROJECT_ROOT/lib/core/sudo.sh'; echo \$MOLE_SUDO_ESTABLISHED")
     [[ "$result" == "false" ]] || [[ -z "$result" ]]
+}
+
+@test "request_sudo_access clears four lines in clamshell mode when Touch ID hint is shown" {
+    run /bin/bash -c '
+        unset MOLE_TEST_MODE MOLE_TEST_NO_AUTH
+        source "'"$PROJECT_ROOT"'/lib/core/common.sh"
+        source "'"$PROJECT_ROOT"'/lib/core/sudo.sh"
+
+        tty_file="$(mktemp)"
+        chmod 600 "$tty_file"
+
+        sudo() {
+            case "$1" in
+                -n) return 1 ;;
+                -k) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        tty() { printf "%s\n" "$tty_file"; }
+        is_clamshell_mode() { return 0; }
+        check_touchid_support() { return 0; }
+        _request_password() { return 0; }
+        safe_clear_lines() { printf "CLEAR:%s\n" "$1"; }
+
+        request_sudo_access "Admin access required"
+    '
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAR:4"* ]]
+}
+
+@test "request_sudo_access keeps three-line cleanup in clamshell mode without Touch ID" {
+    run /bin/bash -c '
+        unset MOLE_TEST_MODE MOLE_TEST_NO_AUTH
+        source "'"$PROJECT_ROOT"'/lib/core/common.sh"
+        source "'"$PROJECT_ROOT"'/lib/core/sudo.sh"
+
+        tty_file="$(mktemp)"
+        chmod 600 "$tty_file"
+
+        sudo() {
+            case "$1" in
+                -n) return 1 ;;
+                -k) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        tty() { printf "%s\n" "$tty_file"; }
+        is_clamshell_mode() { return 0; }
+        check_touchid_support() { return 1; }
+        _request_password() { return 0; }
+        safe_clear_lines() { printf "CLEAR:%s\n" "$1"; }
+
+        request_sudo_access "Admin access required"
+    '
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAR:3"* ]]
 }

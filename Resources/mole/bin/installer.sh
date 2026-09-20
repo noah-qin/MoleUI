@@ -4,6 +4,13 @@
 
 set -euo pipefail
 
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
 # shellcheck disable=SC2154
 # External variables set by menu_paginated.sh and environment
 declare MOLE_SELECTION_RESULT
@@ -11,6 +18,7 @@ declare MOLE_INSTALLER_SCAN_MAX_DEPTH
 
 export LC_ALL=C
 export LANG=C
+export MOLE_CURRENT_COMMAND="${MOLE_CURRENT_COMMAND:-installer}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/core/common.sh"
@@ -44,6 +52,7 @@ readonly INSTALLER_SCAN_PATHS=(
     "$HOME/Downloads/Telegram Desktop"
 )
 readonly MAX_ZIP_ENTRIES=50
+readonly INSTALLER_EXIT_INCOMPLETE=3
 ZIP_LIST_CMD=()
 IN_ALT_SCREEN=0
 
@@ -128,12 +137,17 @@ scan_all_installers() {
 # Initialize stats
 declare -i total_deleted=0
 declare -i total_size_freed_kb=0
+declare -i total_delete_failed=0
 
 # Global arrays for installer data
 declare -a INSTALLER_PATHS=()
 declare -a INSTALLER_SIZES=()
 declare -a INSTALLER_SOURCES=()
 declare -a DISPLAY_NAMES=()
+declare -a INSTALLER_DELETE_PATHS=()
+declare -a INSTALLER_DELETE_SIZES=()
+declare -a INSTALLER_DELETE_IDENTITIES=()
+declare -a INSTALLER_DELETE_FAILURES=()
 
 # Get source directory display name - for example "Downloads" or "Desktop"
 get_source_display() {
@@ -184,9 +198,19 @@ format_installer_display() {
     truncated_name=$(truncate_by_display_width "$filename" "$available_width")
     local current_width
     current_width=$(get_display_width "$truncated_name")
-    local char_count=${#truncated_name}
+
+    # Get byte count for printf width calculation
+    local old_lc="${LC_ALL:-}"
+    export LC_ALL=C
+    local byte_count=${#truncated_name}
+    if [[ -n "$old_lc" ]]; then
+        export LC_ALL="$old_lc"
+    else
+        unset LC_ALL
+    fi
+
     local padding=$((available_width - current_width))
-    local printf_width=$((char_count + padding))
+    local printf_width=$((byte_count + padding))
 
     # Format: "filename  size | source"
     printf "%-*s %8s | %-10s" "$printf_width" "$truncated_name" "$size_str" "$source"
@@ -518,41 +542,150 @@ show_installer_menu() {
     return 0
 }
 
+reset_installer_delete_results() {
+    total_deleted=0
+    total_size_freed_kb=0
+    total_delete_failed=0
+    INSTALLER_DELETE_FAILURES=()
+}
+
+reset_installer_delete_plan() {
+    INSTALLER_DELETE_PATHS=()
+    INSTALLER_DELETE_SIZES=()
+    INSTALLER_DELETE_IDENTITIES=()
+}
+
+record_installer_delete_failure() {
+    local file_path="$1"
+    local reason="$2"
+
+    INSTALLER_DELETE_FAILURES+=("$file_path ($reason)")
+    total_delete_failed=$((total_delete_failed + 1))
+}
+
+installer_file_size_bytes() {
+    local file_path="$1"
+    local file_size
+
+    file_size=$(get_file_size "$file_path" 2> /dev/null || echo "")
+    [[ "$file_size" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$file_size"
+}
+
+build_installer_delete_plan() {
+    reset_installer_delete_plan
+
+    local idx
+    for idx in "$@"; do
+        if [[ ! "$idx" =~ ^[0-9]+$ ]] || [[ $idx -ge ${#INSTALLER_PATHS[@]} ]]; then
+            record_installer_delete_failure "$idx" "stale selection"
+            continue
+        fi
+
+        local file_path="${INSTALLER_PATHS[$idx]}"
+        local file_size="${INSTALLER_SIZES[$idx]:-0}"
+        if [[ ! "$file_size" =~ ^[0-9]+$ ]]; then
+            file_size=0
+        fi
+
+        INSTALLER_DELETE_PATHS+=("$file_path")
+        INSTALLER_DELETE_SIZES+=("$file_size")
+        INSTALLER_DELETE_IDENTITIES+=("$(mole_path_identity "$file_path")")
+    done
+
+    [[ ${#INSTALLER_DELETE_PATHS[@]} -gt 0 ]]
+}
+
+execute_installer_delete_plan() {
+    local plan_index
+    for ((plan_index = 0; plan_index < ${#INSTALLER_DELETE_PATHS[@]}; plan_index++)); do
+        local file_path="${INSTALLER_DELETE_PATHS[$plan_index]}"
+        local planned_size="${INSTALLER_DELETE_SIZES[$plan_index]}"
+        local planned_identity="${INSTALLER_DELETE_IDENTITIES[$plan_index]}"
+
+        if [[ ! -e "$file_path" && ! -L "$file_path" ]]; then
+            record_installer_delete_failure "$file_path" "missing"
+            continue
+        fi
+
+        local current_identity
+        current_identity=$(mole_path_identity "$file_path")
+        if [[ "$current_identity" != "$planned_identity" ]]; then
+            record_installer_delete_failure "$file_path" "changed since scan"
+            continue
+        fi
+
+        local current_size
+        if ! current_size=$(installer_file_size_bytes "$file_path"); then
+            record_installer_delete_failure "$file_path" "size unavailable"
+            continue
+        fi
+        if [[ "$current_size" != "$planned_size" ]]; then
+            record_installer_delete_failure "$file_path" "changed since scan"
+            continue
+        fi
+
+        if mole_delete "$file_path" false; then
+            if [[ "${MOLE_DRY_RUN:-0}" == "1" ]] || [[ ! -e "$file_path" && ! -L "$file_path" ]]; then
+                total_size_freed_kb=$((total_size_freed_kb + ((current_size + 1023) / 1024)))
+                total_deleted=$((total_deleted + 1))
+            else
+                record_installer_delete_failure "$file_path" "still exists"
+            fi
+        else
+            record_installer_delete_failure "$file_path" "delete failed"
+        fi
+    done
+
+    if [[ $total_delete_failed -gt 0 ]]; then
+        return "$INSTALLER_EXIT_INCOMPLETE"
+    fi
+    return 0
+}
+
 # Delete selected installers
 delete_selected_installers() {
+    reset_installer_delete_results
+
     # Parse selection indices
     local -a selected_indices=()
-    [[ -n "$MOLE_SELECTION_RESULT" ]] && IFS=',' read -ra selected_indices <<< "$MOLE_SELECTION_RESULT"
+    if [[ -n "$MOLE_SELECTION_RESULT" ]]; then
+        IFS=',' read -ra selected_indices <<< "$MOLE_SELECTION_RESULT"
+    fi
 
     if [[ ${#selected_indices[@]} -eq 0 ]]; then
         return 1
     fi
 
-    # Calculate total size for confirmation
-    local confirm_size=0
-    for idx in "${selected_indices[@]}"; do
-        if [[ "$idx" =~ ^[0-9]+$ ]] && [[ $idx -lt ${#INSTALLER_SIZES[@]} ]]; then
-            confirm_size=$((confirm_size + ${INSTALLER_SIZES[$idx]:-0}))
+    if ! build_installer_delete_plan "${selected_indices[@]}"; then
+        if [[ $total_delete_failed -gt 0 ]]; then
+            return "$INSTALLER_EXIT_INCOMPLETE"
         fi
+        return 1
+    fi
+
+    local confirm_size=0
+    local plan_index
+    for ((plan_index = 0; plan_index < ${#INSTALLER_DELETE_SIZES[@]}; plan_index++)); do
+        confirm_size=$((confirm_size + ${INSTALLER_DELETE_SIZES[$plan_index]}))
     done
+
     local confirm_human
     confirm_human=$(bytes_to_human "$confirm_size")
 
     # Show files to be deleted
     echo -e "${PURPLE_BOLD}Files to be removed:${NC}"
-    for idx in "${selected_indices[@]}"; do
-        if [[ "$idx" =~ ^[0-9]+$ ]] && [[ $idx -lt ${#INSTALLER_PATHS[@]} ]]; then
-            local file_path="${INSTALLER_PATHS[$idx]}"
-            local file_size="${INSTALLER_SIZES[$idx]}"
-            local size_human
-            size_human=$(bytes_to_human "$file_size")
-            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $(basename "$file_path") ${GRAY}, ${size_human}${NC}"
-        fi
+    for ((plan_index = 0; plan_index < ${#INSTALLER_DELETE_PATHS[@]}; plan_index++)); do
+        local file_path="${INSTALLER_DELETE_PATHS[$plan_index]}"
+        local file_size="${INSTALLER_DELETE_SIZES[$plan_index]}"
+        local size_human
+        size_human=$(bytes_to_human "$file_size")
+        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $(basename "$file_path") ${GRAY}, ${size_human}${NC}"
     done
 
     # Confirm deletion
     echo ""
-    echo -ne "${PURPLE}${ICON_ARROW}${NC} Delete ${#selected_indices[@]} installers, ${confirm_human}  ${GREEN}Enter${NC} confirm, ${GRAY}ESC${NC} cancel: "
+    echo -ne "${PURPLE}${ICON_ARROW}${NC} Delete ${#INSTALLER_DELETE_PATHS[@]} installers, ${confirm_human}  ${GREEN}Enter${NC} confirm, ${GRAY}ESC${NC} cancel: "
 
     IFS= read -r -s -n1 confirm || confirm=""
     case "$confirm" in
@@ -569,38 +702,18 @@ delete_selected_installers() {
     esac
 
     # Delete each selected installer with spinner
-    total_deleted=0
-    total_size_freed_kb=0
-
     if [[ -t 1 ]]; then
         start_inline_spinner "Removing installers..."
     fi
 
-    for idx in "${selected_indices[@]}"; do
-        if [[ ! "$idx" =~ ^[0-9]+$ ]] || [[ $idx -ge ${#INSTALLER_PATHS[@]} ]]; then
-            continue
-        fi
-
-        local file_path="${INSTALLER_PATHS[$idx]}"
-        local file_size="${INSTALLER_SIZES[$idx]}"
-
-        # Validate path before deletion
-        if ! validate_path_for_deletion "$file_path"; then
-            continue
-        fi
-
-        # Delete the file
-        if safe_remove "$file_path" true; then
-            total_size_freed_kb=$((total_size_freed_kb + ((file_size + 1023) / 1024)))
-            total_deleted=$((total_deleted + 1))
-        fi
-    done
+    local delete_status=0
+    execute_installer_delete_plan || delete_status=$?
 
     if [[ -t 1 ]]; then
         stop_inline_spinner
     fi
 
-    return 0
+    return "$delete_status"
 }
 
 # Perform the installers cleanup
@@ -640,8 +753,10 @@ perform_installers() {
     fi
 
     # Delete selected
-    if ! delete_selected_installers; then
-        return 1
+    local delete_status=0
+    delete_selected_installers || delete_status=$?
+    if [[ $delete_status -ne 0 ]]; then
+        return "$delete_status"
     fi
 
     return 0
@@ -654,6 +769,8 @@ show_summary() {
 
     if [[ "$dry_run_mode" == "1" ]]; then
         summary_heading="Dry run complete - no changes made"
+    elif [[ $total_delete_failed -gt 0 ]]; then
+        summary_heading="Installer cleanup incomplete"
     fi
 
     if [[ $total_deleted -gt 0 ]]; then
@@ -664,10 +781,34 @@ show_summary() {
             summary_details+=("Would remove ${GREEN}$total_deleted${NC} installers, free ${GREEN}${freed_mb}MB${NC}")
         else
             summary_details+=("Removed ${GREEN}$total_deleted${NC} installers, freed ${GREEN}${freed_mb}MB${NC}")
-            summary_details+=("Your Mac is cleaner now!")
+            if [[ $total_delete_failed -eq 0 ]]; then
+                summary_details+=("Your Mac is cleaner now!")
+            fi
         fi
     else
         summary_details+=("No installers were removed")
+    fi
+
+    if [[ $total_delete_failed -gt 0 ]]; then
+        local failure_label="installers"
+        [[ $total_delete_failed -eq 1 ]] && failure_label="installer"
+        summary_details+=("Failed to remove ${YELLOW}$total_delete_failed${NC} $failure_label")
+
+        local failure_count=${#INSTALLER_DELETE_FAILURES[@]}
+        local failure_limit=5
+        if [[ $failure_count -lt $failure_limit ]]; then
+            failure_limit=$failure_count
+        fi
+
+        local failure_index
+        for ((failure_index = 0; failure_index < failure_limit; failure_index++)); do
+            local failure_detail="${INSTALLER_DELETE_FAILURES[$failure_index]}"
+            summary_details+=("${ICON_WARNING} $failure_detail")
+        done
+
+        if [[ $failure_count -gt $failure_limit ]]; then
+            summary_details+=("${ICON_WARNING} $((failure_count - failure_limit)) more failed")
+        fi
     fi
 
     print_summary_block "$summary_heading" "${summary_details[@]}"
@@ -688,7 +829,7 @@ main() {
                 export MOLE_DRY_RUN=1
                 ;;
             *)
-                echo "Unknown option: $arg"
+                echo "Unknown option: $arg" >&2
                 exit 1
                 ;;
         esac
@@ -700,13 +841,20 @@ main() {
     fi
 
     hide_cursor
-    perform_installers
-    local exit_code=$?
+    # Capture the status without tripping errexit: a bare call under set -e
+    # would exit the script before the case handler below could report
+    # incomplete cleanup.
+    local exit_code=0
+    perform_installers || exit_code=$?
     show_cursor
 
     case $exit_code in
         0)
             show_summary
+            ;;
+        "$INSTALLER_EXIT_INCOMPLETE")
+            show_summary
+            return 1
             ;;
         1)
             printf '\n'

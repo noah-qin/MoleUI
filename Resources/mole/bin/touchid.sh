@@ -5,6 +5,13 @@
 
 set -euo pipefail
 
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
 # Determine script location and source common functions
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
@@ -21,6 +28,11 @@ PAM_SUDO_LOCAL_FILE="${MOLE_PAM_SUDO_LOCAL_FILE:-$(dirname "$PAM_SUDO_FILE")/sud
 readonly PAM_SUDO_FILE
 readonly PAM_SUDO_LOCAL_FILE
 readonly PAM_TID_LINE="auth       sufficient     pam_tid.so"
+
+secure_install_pam() {
+    local src="$1" dst="$2"
+    sudo install -m 444 -o root -g wheel "$src" "$dst" && rm -f "$src"
+}
 
 # Check if Touch ID is already configured
 is_touchid_configured() {
@@ -108,7 +120,7 @@ enable_touchid() {
                 # Clean up legacy config
                 temp_file=$(create_temp_file)
                 grep -v "pam_tid.so" "$PAM_SUDO_FILE" > "$temp_file"
-                if sudo mv "$temp_file" "$PAM_SUDO_FILE" 2> /dev/null; then
+                if secure_install_pam "$temp_file" "$PAM_SUDO_FILE" 2> /dev/null; then
                     echo -e "${GREEN}${ICON_SUCCESS} Cleanup legacy configuration${NC}"
                 fi
             fi
@@ -138,9 +150,7 @@ enable_touchid() {
                 temp_file=$(create_temp_file)
                 cp "$PAM_SUDO_LOCAL_FILE" "$temp_file"
                 echo "$PAM_TID_LINE" >> "$temp_file"
-                sudo mv "$temp_file" "$PAM_SUDO_LOCAL_FILE"
-                sudo chmod 444 "$PAM_SUDO_LOCAL_FILE"
-                sudo chown root:wheel "$PAM_SUDO_LOCAL_FILE"
+                secure_install_pam "$temp_file" "$PAM_SUDO_LOCAL_FILE"
                 write_success=true
             else
                 write_success=true # Already there (should be caught by first check, but safe fallback)
@@ -152,7 +162,7 @@ enable_touchid() {
             if $is_legacy_configured; then
                 temp_file=$(create_temp_file)
                 grep -v "pam_tid.so" "$PAM_SUDO_FILE" > "$temp_file"
-                sudo mv "$temp_file" "$PAM_SUDO_FILE"
+                secure_install_pam "$temp_file" "$PAM_SUDO_FILE"
                 log_success "Touch ID migrated to sudo_local"
             else
                 log_success "Touch ID enabled, via sudo_local, try: sudo ls"
@@ -201,7 +211,7 @@ enable_touchid() {
     fi
 
     # Apply the changes
-    if sudo mv "$temp_file" "$PAM_SUDO_FILE" 2> /dev/null; then
+    if secure_install_pam "$temp_file" "$PAM_SUDO_FILE" 2> /dev/null; then
         log_success "Touch ID enabled, try: sudo ls"
         return 0
     else
@@ -236,12 +246,12 @@ disable_touchid() {
         temp_file=$(create_temp_file)
         grep -v "pam_tid.so" "$PAM_SUDO_LOCAL_FILE" > "$temp_file"
 
-        if sudo mv "$temp_file" "$PAM_SUDO_LOCAL_FILE" 2> /dev/null; then
+        if secure_install_pam "$temp_file" "$PAM_SUDO_LOCAL_FILE" 2> /dev/null; then
             # Since we modified sudo_local, we should also check if it's in sudo file (legacy cleanup)
             if grep -q "pam_tid.so" "$PAM_SUDO_FILE"; then
                 temp_file=$(create_temp_file)
                 grep -v "pam_tid.so" "$PAM_SUDO_FILE" > "$temp_file"
-                sudo mv "$temp_file" "$PAM_SUDO_FILE"
+                secure_install_pam "$temp_file" "$PAM_SUDO_FILE"
             fi
             echo -e "${GREEN}${ICON_SUCCESS} Touch ID disabled, removed from sudo_local${NC}"
             echo ""
@@ -266,7 +276,7 @@ disable_touchid() {
         temp_file=$(create_temp_file)
         grep -v "pam_tid.so" "$PAM_SUDO_FILE" > "$temp_file"
 
-        if sudo mv "$temp_file" "$PAM_SUDO_FILE" 2> /dev/null; then
+        if secure_install_pam "$temp_file" "$PAM_SUDO_FILE" 2> /dev/null; then
             echo -e "${GREEN}${ICON_SUCCESS} Touch ID disabled${NC}"
             echo ""
             return 0
@@ -292,7 +302,7 @@ show_menu() {
         echo ""
 
         case "$key" in
-            $'\e') # ESC
+            $'\e' | q | Q) # ESC or Q
                 return 0
                 ;;
             "" | $'\n' | $'\r')   # Enter
@@ -310,7 +320,7 @@ show_menu() {
         drain_pending_input # Clean up any escape sequence remnants
 
         case "$key" in
-            $'\e') # ESC
+            $'\e' | q | Q) # ESC or Q
                 return 0
                 ;;
             "" | $'\n' | $'\r')   # Enter

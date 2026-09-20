@@ -1,0 +1,101 @@
+name: Mac App Bug
+description: Report a bug in the paid Mole Mac app.
+title: "[Mac App Bug] "
+labels: ["mac-app", "bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Mole Mac app bug.
+
+        The Mole Mac app is a paid native app. Its source code is not public. This repository hosts the open-source Mole CLI and public feedback for the Mac app.
+
+        Do not include license keys, order numbers, private paths, or logs with personal data. For payment, refund, license, or security issues, email hi@mole.fit instead.
+  - type: input
+    id: app_version
+    attributes:
+      label: Mole Mac app version
+      description: Open Mole, choose About Mole, and paste the version shown there.
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: macos_version
+    attributes:
+      label: macOS version
+      placeholder: "macOS 15.5"
+    validations:
+      required: true
+  - type: input
+    id: mac_model
+    attributes:
+      label: Mac model
+      placeholder: "MacBook Pro M3 Pro, Mac mini M2, etc."
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Full Disk Access / permissions
+        - Clean
+        - Uninstall
+        - Optimize
+        - Analyze
+        - Status
+        - Activation / license
+        - Download / update
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly. Screenshots are welcome if they do not reveal private data.
+      placeholder: "Mole did..."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Mole
+        2. Go to ...
+        3. Click ...
+        4. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "I expected Mole to..."
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: "Instead, Mole..."
+    validations:
+      required: true
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Screenshots or safe logs
+      description: Attach screenshots or paste logs only after removing private paths, license keys, and order details.
+      placeholder: "Drag screenshots here, or paste safe logs."
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I am using the latest Mole Mac app build available from https://mole.fit.
+          required: true
+        - label: I did not include license keys, order numbers, or private data.
+          required: true

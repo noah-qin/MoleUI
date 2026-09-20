@@ -72,6 +72,11 @@ paginated_multi_select() {
     local title="$1"
     shift
     local -a items=("$@")
+    # A deliberate quit and a real failure both leave through return 1, and
+    # callers deciding between "user cancelled" and "selection broke" need to
+    # tell them apart. Reset here so a stale value from a previous menu can
+    # never masquerade as this run's answer.
+    _MOLE_MENU_USER_QUIT=0
     local external_alt_screen=false
     if [[ "${MOLE_MANAGED_ALT_SCREEN:-}" == "1" || "${MOLE_MANAGED_ALT_SCREEN:-}" == "true" ]]; then
         external_alt_screen=true
@@ -91,6 +96,7 @@ paginated_multi_select() {
     local sort_reverse="${MOLE_MENU_SORT_REVERSE:-false}"
     local filter_text="" # Filter keyword
     local filter_text_lower=""
+    local ignore_initial_enter="${MOLE_MENU_IGNORE_INITIAL_ENTER:-false}"
 
     # Metadata (optional)
     # epochs[i]   -> last_used_epoch (numeric) for item i
@@ -100,13 +106,22 @@ paginated_multi_select() {
     local -a sizekb=()
     local -a filter_names=()
     local has_metadata="false"
+    local has_epoch_metadata="false"
+    local has_size_metadata="false"
     local has_filter_names="false"
     if [[ -n "${MOLE_MENU_META_EPOCHS:-}" ]]; then
-        while IFS= read -r v; do epochs+=("${v:-0}"); done < <(_pm_parse_csv_to_array "$MOLE_MENU_META_EPOCHS")
-        has_metadata="true"
+        while IFS= read -r v; do
+            epochs+=("${v:-0}")
+            [[ "${v:-0}" =~ ^[0-9]+$ && "${v:-0}" -gt 0 ]] && has_epoch_metadata="true"
+        done < <(_pm_parse_csv_to_array "$MOLE_MENU_META_EPOCHS")
     fi
     if [[ -n "${MOLE_MENU_META_SIZEKB:-}" ]]; then
-        while IFS= read -r v; do sizekb+=("${v:-0}"); done < <(_pm_parse_csv_to_array "$MOLE_MENU_META_SIZEKB")
+        while IFS= read -r v; do
+            sizekb+=("${v:-0}")
+            [[ "${v:-0}" =~ ^[0-9]+$ && "${v:-0}" -gt 0 ]] && has_size_metadata="true"
+        done < <(_pm_parse_csv_to_array "$MOLE_MENU_META_SIZEKB")
+    fi
+    if [[ "$has_epoch_metadata" == "true" || "$has_size_metadata" == "true" ]]; then
         has_metadata="true"
     fi
     if [[ -n "${MOLE_MENU_FILTER_NAMES:-}" ]]; then
@@ -114,9 +129,49 @@ paginated_multi_select() {
         has_filter_names="true"
     fi
 
-    # If no metadata, force name sorting and disable sorting controls
-    if [[ "$has_metadata" == "false" && "$sort_mode" != "name" ]]; then
+    sort_mode_available() {
+        case "$1" in
+            date) [[ "$has_epoch_metadata" == "true" ]] ;;
+            size) [[ "$has_size_metadata" == "true" ]] ;;
+            name) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    normalize_sort_mode() {
+        sort_mode_available "$sort_mode" && return 0
+        if [[ "$has_epoch_metadata" == "true" ]]; then
+            sort_mode="date"
+        elif [[ "$has_size_metadata" == "true" ]]; then
+            sort_mode="size"
+        else
+            sort_mode="name"
+        fi
+    }
+
+    cycle_sort_mode() {
+        local candidate
+        case "$sort_mode" in
+            date) set -- name size date ;;
+            name) set -- size date name ;;
+            size) set -- date name size ;;
+            *) set -- date name size ;;
+        esac
+
+        for candidate in "$@"; do
+            if sort_mode_available "$candidate"; then
+                sort_mode="$candidate"
+                return 0
+            fi
+        done
         sort_mode="name"
+    }
+
+    # If no metadata, force name sorting and disable sorting controls.
+    if [[ "$has_metadata" == "false" ]]; then
+        sort_mode="name"
+    else
+        normalize_sort_mode
     fi
 
     # Index mappings
@@ -179,9 +234,28 @@ paginated_multi_select() {
         fi
     }
 
+    # Save the caller's EXIT/INT/TERM traps before overriding them. Restoring
+    # rather than clearing on exit keeps an outer handler alive, e.g.
+    # bin/uninstall.sh arms `trap cleanup EXIT` whose only job is writing the
+    # session-end operation log; a bare `trap - EXIT` here dropped it silently.
+    local _menu_saved_exit _menu_saved_int _menu_saved_term
+    _menu_saved_exit=$(trap -p EXIT)
+    _menu_saved_int=$(trap -p INT)
+    _menu_saved_term=$(trap -p TERM)
+    # Uses :- defaults: _pm_cleanup() is the EXIT trap and may fire once more at
+    # shell exit after this function has returned and the saved-trap locals
+    # are gone. Degrading to `trap -` then is harmless (the caller's trap was
+    # already restored on the normal-exit path below).
+    # shellcheck disable=SC2329
+    _menu_restore_traps() {
+        if [[ -n "${_menu_saved_exit:-}" ]]; then eval "${_menu_saved_exit}"; else trap - EXIT; fi
+        if [[ -n "${_menu_saved_int:-}" ]]; then eval "${_menu_saved_int}"; else trap - INT; fi
+        if [[ -n "${_menu_saved_term:-}" ]]; then eval "${_menu_saved_term}"; else trap - TERM; fi
+    }
+
     # Cleanup function
-    cleanup() {
-        trap - EXIT INT TERM
+    _pm_cleanup() {
+        _menu_restore_traps
         unset MOLE_READ_KEY_FORCE_CHAR
         export MOLE_MENU_SORT_MODE="${sort_mode:-name}"
         export MOLE_MENU_SORT_REVERSE="${sort_reverse:-false}"
@@ -190,13 +264,13 @@ paginated_multi_select() {
 
     # Interrupt handler
     # shellcheck disable=SC2329
-    handle_interrupt() {
-        cleanup
+    _pm_handle_interrupt() {
+        _pm_cleanup
         exit 130 # Standard exit code for Ctrl+C
     }
 
-    trap cleanup EXIT
-    trap handle_interrupt INT TERM
+    trap _pm_cleanup EXIT
+    trap _pm_handle_interrupt INT TERM
 
     # Setup terminal - preserve interrupt character
     stty -echo -icanon intr ^C 2> /dev/null || true
@@ -259,7 +333,7 @@ paginated_multi_select() {
     local -a filter_cache_indices=()
 
     ensure_sorted_indices() {
-        local requested_key="${sort_mode}:${sort_reverse}:${has_metadata}"
+        local requested_key="${sort_mode}:${sort_reverse}:${has_epoch_metadata}:${has_size_metadata}"
         if [[ "$requested_key" == "$sort_cache_key" && ${#sorted_indices_cache[@]} -gt 0 ]]; then
             return
         fi
@@ -400,9 +474,9 @@ paginated_multi_select() {
     draw_header() {
         printf "\033[1;1H" >&2
         if [[ -n "$filter_text" ]]; then
-            printf "\r\033[2K${PURPLE_BOLD}%s${NC}  ${YELLOW}/ Filter: ${filter_text}_${NC}  ${GRAY}(%d/%d)${NC}\n" "${title}" "${#view_indices[@]}" "$total_items" >&2
+            printf "\r\033[2K${PURPLE_BOLD}%s${NC}  ${YELLOW}/ Search: ${filter_text}_${NC}  ${GRAY}(%d/%d)${NC}\n" "${title}" "${#view_indices[@]}" "$total_items" >&2
         elif [[ -n "${MOLE_READ_KEY_FORCE_CHAR:-}" ]]; then
-            printf "\r\033[2K${PURPLE_BOLD}%s${NC}  ${YELLOW}/ Filter: _ ${NC}${GRAY}(type to search)${NC}\n" "${title}" >&2
+            printf "\r\033[2K${PURPLE_BOLD}%s${NC}  ${YELLOW}/ Search: _ ${NC}${GRAY}(type to search)${NC}\n" "${title}" >&2
         else
             printf "\r\033[2K${PURPLE_BOLD}%s${NC}  ${GRAY}%d/%d selected${NC}\n" "${title}" "$selected_count" "$total_items" >&2
         fi
@@ -444,7 +518,7 @@ paginated_multi_select() {
             for ((i = 0; i < items_per_page; i++)); do
                 printf "${clear_line}\n" >&2
             done
-            printf "${clear_line}${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}  |  Space  |  Enter  |  Q Exit${NC}\n" >&2
+            printf "${clear_line}${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}  |  Space  |  Enter Save  |  Q Cancel${NC}\n" >&2
             printf "${clear_line}" >&2
             return
         fi
@@ -502,16 +576,17 @@ paginated_multi_select() {
 
         # Common menu items
         local nav="${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}${NC}"
+        local page_ctrl="${GRAY}h/l Page${NC}"
         local space_select="${GRAY}Space Select${NC}"
-        local enter="${GRAY}Enter${NC}"
-        local exit="${GRAY}Q Exit${NC}"
+        local enter="${GRAY}Enter Save${NC}"
+        local cancel_label="${GRAY}Q Cancel${NC}"
 
         local reverse_arrow="↑"
         [[ "$sort_reverse" == "true" ]] && reverse_arrow="↓"
 
         local sort_ctrl="${GRAY}S ${sort_status}${NC}"
         local order_ctrl="${GRAY}O ${reverse_arrow}${NC}"
-        local filter_ctrl="${GRAY}/ Filter${NC}"
+        local filter_ctrl="${GRAY}/ Search${NC}"
 
         if [[ -n "$filter_text" ]]; then
             local -a _segs_filter=("${GRAY}Backspace${NC}" "${GRAY}Ctrl+U Clear${NC}" "${GRAY}ESC Clear${NC}")
@@ -523,7 +598,7 @@ paginated_multi_select() {
             [[ "$term_width" =~ ^[0-9]+$ ]] || term_width=80
 
             # Full controls
-            local -a _segs=("$nav" "$space_select" "$enter" "$sort_ctrl" "$order_ctrl" "$filter_ctrl" "$exit")
+            local -a _segs=("$nav" "$page_ctrl" "$space_select" "$enter" "$sort_ctrl" "$order_ctrl" "$filter_ctrl" "$cancel_label")
 
             # Calculate width
             local total_len=0 seg_count=${#_segs[@]}
@@ -532,9 +607,13 @@ paginated_multi_select() {
                 [[ $i -lt $((seg_count - 1)) ]] && total_len=$((total_len + 3))
             done
 
-            # Level 1: Remove "Space Select" if too wide
+            # Level 1: drop the page and search hints. "Space Select" is the
+            # only footer entry that teaches the primary interaction, so it
+            # outranks paging, sorting and filtering, which a user finds by
+            # trying keys. Dropping it first made multi-select invisible below
+            # 76 columns and read as "uninstall has no multi-select" (#1382).
             if [[ $total_len -gt $term_width ]]; then
-                _segs=("$nav" "$enter" "$sort_ctrl" "$order_ctrl" "$filter_ctrl" "$exit")
+                _segs=("$nav" "$space_select" "$enter" "$sort_ctrl" "$order_ctrl" "$cancel_label")
 
                 total_len=0
                 seg_count=${#_segs[@]}
@@ -543,16 +622,16 @@ paginated_multi_select() {
                     [[ $i -lt $((seg_count - 1)) ]] && total_len=$((total_len + 3))
                 done
 
-                # Level 2: Remove sort label if still too wide
+                # Level 2: keep only selection, save and cancel.
                 if [[ $total_len -gt $term_width ]]; then
-                    _segs=("$nav" "$enter" "$order_ctrl" "$filter_ctrl" "$exit")
+                    _segs=("$nav" "$space_select" "$enter" "$cancel_label")
                 fi
             fi
 
             _print_wrapped_controls "$sep" "${_segs[@]}"
         else
             # Without metadata: basic controls
-            local -a _segs_simple=("$nav" "$space_select" "$enter" "$filter_ctrl" "$exit")
+            local -a _segs_simple=("$nav" "$page_ctrl" "$space_select" "$enter" "$filter_ctrl" "$cancel_label")
             _print_wrapped_controls "$sep" "${_segs_simple[@]}"
         fi
         printf "${clear_line}" >&2
@@ -575,6 +654,12 @@ paginated_multi_select() {
 
         local key
         key=$(read_key)
+        if [[ "$ignore_initial_enter" == "true" || "$ignore_initial_enter" == "1" ]]; then
+            ignore_initial_enter=false
+            if [[ "$key" == "ENTER" ]]; then
+                continue
+            fi
+        fi
 
         case "$key" in
             "QUIT")
@@ -587,7 +672,8 @@ paginated_multi_select() {
                     top_index=0
                     need_full_redraw=true
                 else
-                    cleanup
+                    _MOLE_MENU_USER_QUIT=1
+                    _pm_cleanup
                     return 1
                 fi
                 ;;
@@ -707,6 +793,51 @@ paginated_multi_select() {
                     fi
                 fi
                 ;;
+            "TOP")
+                if [[ ${#view_indices[@]} -gt 0 ]]; then
+                    cursor_pos=0
+                    top_index=0
+                    need_full_redraw=true
+                fi
+                ;;
+            "BOTTOM")
+                if [[ ${#view_indices[@]} -gt 0 ]]; then
+                    local visible_total=${#view_indices[@]}
+                    if [[ $visible_total -gt $items_per_page ]]; then
+                        top_index=$((visible_total - items_per_page))
+                        cursor_pos=$((items_per_page - 1))
+                    else
+                        top_index=0
+                        cursor_pos=$((visible_total - 1))
+                    fi
+                    need_full_redraw=true
+                fi
+                ;;
+            "LEFT")
+                if [[ ${#view_indices[@]} -gt 0 ]]; then
+                    if [[ $top_index -gt 0 ]]; then
+                        top_index=$((top_index - items_per_page))
+                        [[ $top_index -lt 0 ]] && top_index=0
+                    fi
+                    cursor_pos=0
+                    need_full_redraw=true
+                fi
+                ;;
+            "RIGHT")
+                if [[ ${#view_indices[@]} -gt 0 ]]; then
+                    local visible_total=${#view_indices[@]}
+                    if [[ $((top_index + items_per_page)) -lt $visible_total ]]; then
+                        top_index=$((top_index + items_per_page))
+                        local _remaining=$((visible_total - top_index))
+                        if [[ $_remaining -lt $items_per_page ]]; then
+                            top_index=$((visible_total - items_per_page))
+                            [[ $top_index -lt 0 ]] && top_index=0
+                        fi
+                    fi
+                    cursor_pos=0
+                    need_full_redraw=true
+                fi
+                ;;
             "SPACE")
                 local idx=$((top_index + cursor_pos))
                 if [[ $idx -lt ${#view_indices[@]} ]]; then
@@ -738,11 +869,7 @@ paginated_multi_select() {
                 if handle_filter_char "${key#CHAR:}"; then
                     : # Handled as filter input
                 elif [[ "$has_metadata" == "true" ]]; then
-                    case "$sort_mode" in
-                        date) sort_mode="name" ;;
-                        name) sort_mode="size" ;;
-                        size) sort_mode="date" ;;
-                    esac
+                    cycle_sort_mode
                     rebuild_view
                     need_full_redraw=true
                 fi
@@ -861,7 +988,7 @@ paginated_multi_select() {
                     final_result="${selected_indices[*]}"
                 fi
 
-                trap - EXIT INT TERM
+                _menu_restore_traps
                 MOLE_SELECTION_RESULT="$final_result"
                 unset MOLE_READ_KEY_FORCE_CHAR
                 export MOLE_MENU_SORT_MODE="${sort_mode:-name}"

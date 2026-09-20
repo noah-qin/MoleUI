@@ -10,6 +10,8 @@ assignees: ''
 
 A clear and concise description of what the bug is. We suggest using English for better global understanding.
 
+If you believe the issue may allow unsafe deletion, path validation bypass, privilege boundary bypass, or release/install integrity issues, do not file a public bug report. Report it privately using the contact details in `SECURITY.md`.
+
 ## Steps to reproduce
 
 1. Run command: `mo ...`

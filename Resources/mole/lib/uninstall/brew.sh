@@ -35,6 +35,41 @@ is_homebrew_available() {
     command -v brew > /dev/null 2>&1
 }
 
+# Run a read-only Homebrew probe under a hard deadline. The bash wrapper keeps
+# exported test doubles working while production still resolves the real brew
+# executable from PATH. More importantly, timeout/signal statuses remain
+# distinguishable from a legitimate "not installed" result.
+_mole_brew_probe() {
+    local duration="$1"
+    shift
+
+    if declare -F brew > /dev/null 2>&1; then
+        export -f brew
+    fi
+
+    HOMEBREW_NO_ENV_HINTS=1 run_with_timeout "$duration" \
+        /bin/bash --noprofile --norc -c 'brew "$@"' mole-brew-probe "$@"
+}
+
+# Check whether a cask is still recorded as installed in Homebrew.
+# Exit codes:
+#   0 - cask is installed
+#   1 - cask is not installed
+#   2 - install state could not be determined
+is_brew_cask_installed() {
+    local cask_name="$1"
+    [[ -n "$cask_name" ]] || return 2
+    is_homebrew_available || return 2
+
+    local cask_list=""
+    local list_rc=0
+    cask_list=$(_mole_brew_probe "$MOLE_TIMEOUT_PKG_LIST_SEC" \
+        list --cask 2> /dev/null) || list_rc=$?
+    [[ $list_rc -eq 124 || $list_rc -ge 128 ]] && return "$list_rc"
+    [[ $list_rc -eq 0 ]] || return 2
+    grep -qxF "$cask_name" <<< "$cask_list"
+}
+
 # Extract cask token from a Caskroom path
 # Args: $1 - path (must be inside Caskroom)
 # Prints: cask token to stdout
@@ -42,9 +77,10 @@ is_homebrew_available() {
 _extract_cask_token_from_path() {
     local path="$1"
 
-    # Check if path is inside Caskroom
+    # Check if path is inside Caskroom. Quote literals so Homebrew bottle
+    # relocation cannot break parsing when the prefix contains spaces.
     case "$path" in
-        /opt/homebrew/Caskroom/* | /usr/local/Caskroom/*) ;;
+        "/opt/homebrew/Caskroom/"* | "/usr/local/Caskroom/"*) ;;
         *) return 1 ;;
     esac
 
@@ -68,6 +104,7 @@ _detect_cask_via_resolved_path() {
     local app_path="$1"
     local resolved
     if resolved=$(resolve_path "$app_path") && [[ -n "$resolved" ]]; then
+        [[ "$(basename "$resolved")" == "$(basename "$app_path")" ]] || return 1
         _extract_cask_token_from_path "$resolved" && return 0
     fi
     return 1
@@ -78,30 +115,98 @@ _detect_cask_via_resolved_path() {
 # Only succeeds if exactly one cask matches (avoids wrong uninstall)
 _detect_cask_via_caskroom_search() {
     local app_bundle_name="$1"
+    local app_path="${2:-}"
     [[ -z "$app_bundle_name" ]] && return 1
 
     local -a tokens=()
     local room match token
+    local exact_app_link=""
+    local scan_file=""
+    scan_file=$(create_temp_file) || return 1
+    local scan_deadline=$((SECONDS + MOLE_TIMEOUT_PKG_LIST_SEC))
 
     for room in "/opt/homebrew/Caskroom" "/usr/local/Caskroom"; do
         [[ -d "$room" ]] || continue
+        local scan_timeout=""
+        local scan_rc=0
+        scan_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
+            "$scan_deadline") || scan_rc=$?
+        if [[ $scan_rc -eq 0 ]]; then
+            : > "$scan_file" || scan_rc=1
+        fi
+        if [[ $scan_rc -eq 0 ]]; then
+            run_with_timeout "$scan_timeout" find "$room" -maxdepth 3 \
+                -name "$app_bundle_name" < /dev/null > "$scan_file" \
+                2> /dev/null || scan_rc=$?
+        fi
+        if [[ $scan_rc -ne 0 ]]; then
+            : > "$scan_file" || true
+            rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+            return "$scan_rc"
+        fi
         while IFS= read -r match; do
             [[ -n "$match" ]] || continue
             token=$(_extract_cask_token_from_path "$match" 2> /dev/null) || continue
             [[ -n "$token" ]] && tokens+=("$token")
-        done < <(find "$room" -maxdepth 3 -name "$app_bundle_name" 2> /dev/null)
+            if [[ -n "$app_path" && -L "$match" && -d "$app_path" && "$match" -ef "$app_path" ]]; then
+                exact_app_link="$match"
+            fi
+        done < "$scan_file"
     done
+    rm -f -- "$scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
 
     # Need at least one token
     ((${#tokens[@]} > 0)) || return 1
 
     # Deduplicate and check count
-    local -a uniq
-    IFS=$'\n' read -r -d '' -a uniq < <(printf '%s\n' "${tokens[@]}" | sort -u && printf '\0') || true
+    local -a uniq=()
+    local candidate existing seen
+    for candidate in "${tokens[@]}"; do
+        seen=false
+        for existing in "${uniq[@]+"${uniq[@]}"}"; do
+            if [[ "$candidate" == "$existing" ]]; then
+                seen=true
+                break
+            fi
+        done
+        [[ "$seen" == true ]] || uniq+=("$candidate")
+    done
 
     # Only succeed if exactly one unique token found and it's installed
     if ((${#uniq[@]} == 1)) && [[ -n "${uniq[0]}" ]]; then
-        HOMEBREW_NO_ENV_HINTS=1 brew list --cask 2> /dev/null | grep -qxF "${uniq[0]}" || return 1
+        local cask_list=""
+        local list_rc=0
+        cask_list=$(_mole_brew_probe "$MOLE_TIMEOUT_PKG_LIST_SEC" \
+            list --cask 2> /dev/null) || list_rc=$?
+        [[ $list_rc -eq 124 || $list_rc -ge 128 ]] && return "$list_rc"
+        [[ $list_rc -eq 0 ]] || return 2
+        grep -qxF "${uniq[0]}" <<< "$cask_list" || return 1
+
+        local info_output=""
+        local info_rc=0
+        info_output=$(_mole_brew_probe "$MOLE_TIMEOUT_PKG_LIST_SEC" \
+            info --cask "${uniq[0]}" 2> /dev/null) || info_rc=$?
+        [[ $info_rc -eq 124 || $info_rc -ge 128 ]] && return "$info_rc"
+        if [[ $info_rc -ne 0 ]]; then
+            # Third-party short-token lookup can fail even with an installed
+            # cask. Require its actual app symlink, not just a matching name,
+            # and recheck after the probe in case the link changed meanwhile.
+            if [[ -n "$exact_app_link" && -L "$exact_app_link" && -d "$app_path" &&
+                "$exact_app_link" -ef "$app_path" ]]; then
+                echo "${uniq[0]}"
+                return 0
+            fi
+            return 2
+        fi
+        if [[ -n "$app_path" ]]; then
+            if grep -qF "$app_path" <<< "$info_output"; then
+                :
+            elif [[ "$app_path" == "/Applications/$app_bundle_name" ]] && grep -qF "$app_bundle_name" <<< "$info_output"; then
+                :
+            else
+                return 1
+            fi
+        fi
         echo "${uniq[0]}"
         return 0
     fi
@@ -116,6 +221,7 @@ _detect_cask_via_symlink_check() {
 
     local target
     target=$(readlink "$app_path" 2> /dev/null) || return 1
+    [[ "$(basename "$target")" == "$(basename "$app_path")" ]] || return 1
     _extract_cask_token_from_path "$target"
 }
 
@@ -123,15 +229,37 @@ _detect_cask_via_symlink_check() {
 _detect_cask_via_brew_list() {
     local app_path="$1"
     local app_bundle_name="$2"
+    local app_base_name
     local app_name_lower
-    app_name_lower=$(echo "${app_bundle_name%.app}" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    app_base_name="${app_bundle_name%.[aA][pP][pP]}"
+    app_name_lower=$(printf '%s' "$app_base_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')
 
-    local cask_name
-    cask_name=$(HOMEBREW_NO_ENV_HINTS=1 brew list --cask 2> /dev/null | grep -Fix "$app_name_lower") || return 1
+    local cask_list=""
+    local list_rc=0
+    cask_list=$(_mole_brew_probe "$MOLE_TIMEOUT_PKG_LIST_SEC" \
+        list --cask 2> /dev/null) || list_rc=$?
+    [[ $list_rc -eq 124 || $list_rc -ge 128 ]] && return "$list_rc"
+    [[ $list_rc -eq 0 ]] || return 2
 
-    # Verify this cask actually owns this app path
-    HOMEBREW_NO_ENV_HINTS=1 brew info --cask "$cask_name" 2> /dev/null | grep -qF "$app_path" || return 1
-    echo "$cask_name"
+    local cask_name=""
+    cask_name=$(grep -Fix "$app_name_lower" <<< "$cask_list") || return 1
+
+    # Verify this cask actually owns this app path or app bundle.
+    local info_output=""
+    local info_rc=0
+    info_output=$(_mole_brew_probe "$MOLE_TIMEOUT_PKG_LIST_SEC" \
+        info --cask "$cask_name" 2> /dev/null) || info_rc=$?
+    [[ $info_rc -eq 124 || $info_rc -ge 128 ]] && return "$info_rc"
+    [[ $info_rc -eq 0 ]] || return 2
+    if grep -qF "$app_path" <<< "$info_output"; then
+        echo "$cask_name"
+        return 0
+    fi
+    if [[ "$app_path" == "/Applications/$app_bundle_name" ]] && grep -qF "$app_bundle_name" <<< "$info_output"; then
+        echo "$cask_name"
+        return 0
+    fi
+    return 1
 }
 
 # Get Homebrew cask name for an app
@@ -153,30 +281,56 @@ get_brew_cask_name() {
     app_bundle_name=$(basename "$app_path")
 
     # Try each detection method in order (fast to slow)
-    _detect_cask_via_resolved_path "$app_path" && return 0
-    _detect_cask_via_caskroom_search "$app_bundle_name" && return 0
-    _detect_cask_via_symlink_check "$app_path" && return 0
-    _detect_cask_via_brew_list "$app_path" "$app_bundle_name" && return 0
+    local detect_rc=0
+    _detect_cask_via_resolved_path "$app_path" || detect_rc=$?
+    [[ $detect_rc -eq 0 ]] && return 0
+    [[ $detect_rc -eq 1 ]] || return "$detect_rc"
+
+    detect_rc=0
+    _detect_cask_via_caskroom_search "$app_bundle_name" "$app_path" || detect_rc=$?
+    [[ $detect_rc -eq 0 ]] && return 0
+    [[ $detect_rc -eq 1 ]] || return "$detect_rc"
+
+    detect_rc=0
+    _detect_cask_via_symlink_check "$app_path" || detect_rc=$?
+    [[ $detect_rc -eq 0 ]] && return 0
+    [[ $detect_rc -eq 1 ]] || return "$detect_rc"
+
+    detect_rc=0
+    _detect_cask_via_brew_list "$app_path" "$app_bundle_name" || detect_rc=$?
+    [[ $detect_rc -eq 0 ]] && return 0
+    [[ $detect_rc -eq 1 ]] || return "$detect_rc"
 
     return 1
 }
 
 # Uninstall a Homebrew cask and verify removal
-# Args: $1 - cask_name, $2 - app_path (optional, for verification)
-# Returns: 0 on success, 1 on failure
+# Args: $1 - cask_name, $2 - app_path (optional, for verification),
+#       $3 - zap mode: "nozap" runs a plain uninstall without --zap. Used when
+#            another install shares the cask's bundle id: zap stanzas delete
+#            bundle-id-keyed prefs/caches that the surviving install still
+#            uses (iterm2 and iterm2-beta both zap com.googlecode.iterm2).
+# Returns: 0 on success, 1 on ordinary failure, 124 on timeout, or the
+# original signal-style status when the operation is interrupted.
 brew_uninstall_cask() {
     local cask_name="$1"
     local app_path="${2:-}"
+    local zap_mode="${3:-zap}"
+
+    local -a uninstall_args=(uninstall --cask)
+    if [[ "$zap_mode" != "nozap" ]]; then
+        uninstall_args+=(--zap)
+    fi
 
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
-        debug_log "[DRY RUN] Would brew uninstall --cask --zap $cask_name"
+        debug_log "[DRY RUN] Would brew ${uninstall_args[*]} $cask_name"
         return 0
     fi
 
     is_homebrew_available || return 1
     [[ -z "$cask_name" ]] && return 1
 
-    debug_log "Attempting brew uninstall --cask --zap $cask_name"
+    debug_log "Attempting brew ${uninstall_args[*]} $cask_name"
 
     local uninstall_ok=false
     local brew_exit=0
@@ -184,7 +338,12 @@ brew_uninstall_cask() {
     # Calculate timeout based on app size (large apps need more time)
     local timeout=300 # Default 5 minutes
     if [[ -n "$app_path" && -d "$app_path" ]]; then
-        local size_gb=$(($(get_path_size_kb "$app_path") / 1048576))
+        local size_kb=0
+        local size_rc=0
+        size_kb=$(get_path_size_kb "$app_path") || size_rc=$?
+        [[ $size_rc -eq 124 || $size_rc -ge 128 ]] && return "$size_rc"
+        [[ $size_rc -eq 0 && "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+        local size_gb=$((size_kb / 1048576))
         if [[ $size_gb -gt 15 ]]; then
             timeout=900 # 15 minutes for very large apps (Xcode, Adobe, etc.)
         elif [[ $size_gb -gt 5 ]]; then
@@ -193,25 +352,45 @@ brew_uninstall_cask() {
         debug_log "App size: ${size_gb}GB, timeout: ${timeout}s"
     fi
 
-    # Run with timeout to prevent hangs from problematic cask scripts
-    local brew_exit=0
-    if HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
-        run_with_timeout "$timeout" brew uninstall --cask --zap "$cask_name" 2>&1; then
+    # Run with timeout to prevent hangs from problematic cask scripts.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        if run_with_timeout "$timeout" sudo -u "$SUDO_USER" env \
+            HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
+            brew "${uninstall_args[@]}" "$cask_name" 2>&1; then
+            uninstall_ok=true
+        else
+            brew_exit=$?
+        fi
+    elif HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
+        run_with_timeout "$timeout" brew "${uninstall_args[@]}" "$cask_name" 2>&1; then
         uninstall_ok=true
     else
         brew_exit=$?
+    fi
+
+    if [[ "$uninstall_ok" != "true" ]]; then
         debug_log "brew uninstall timeout or failed with exit code: $brew_exit"
-        # Exit code 124 indicates timeout from run_with_timeout
-        # On timeout, fail immediately without verification to avoid inconsistent state
+        # Timeout and signal statuses are cancellation, not evidence that a
+        # partially completed cask action can safely fall back to direct app
+        # deletion. Preserve them before any verification.
         if [[ $brew_exit -eq 124 ]]; then
             debug_log "brew uninstall timed out after ${timeout}s, returning failure"
-            return 1
+            return 124
+        elif [[ $brew_exit -ge 128 ]]; then
+            return "$brew_exit"
         fi
     fi
 
     # Verify removal (only if not timed out)
     local cask_gone=true app_gone=true
-    HOMEBREW_NO_ENV_HINTS=1 brew list --cask 2> /dev/null | grep -qxF "$cask_name" && cask_gone=false
+    local cask_state=0
+    if is_brew_cask_installed "$cask_name"; then
+        cask_gone=false
+    else
+        cask_state=$?
+        [[ $cask_state -ge 128 ]] && return "$cask_state"
+        [[ $cask_state -eq 1 ]] || cask_gone=false
+    fi
     [[ -n "$app_path" && -e "$app_path" ]] && app_gone=false
 
     # Success: uninstall worked and both are gone, or already uninstalled

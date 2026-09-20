@@ -1,0 +1,24 @@
+#!/usr/bin/expect -f
+
+set timeout 4
+set project_root [lindex $argv 0]
+
+spawn /bin/bash "$project_root/tests/timeout_tty_read_fixture.sh" "$project_root"
+
+expect {
+    -re {READY\r?\n} {}
+    timeout { exit 124 }
+    eof { exit 1 }
+}
+
+send -- "typed-value\r"
+
+expect {
+    -re {READ:typed-value\r?\n} {}
+    timeout { exit 124 }
+    eof { exit 1 }
+}
+
+expect eof
+set result [wait]
+exit [lindex $result 3]

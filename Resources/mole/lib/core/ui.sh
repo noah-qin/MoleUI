@@ -12,6 +12,17 @@ readonly MOLE_UI_LOADED=1
 _MOLE_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -z "${MOLE_BASE_LOADED:-}" ]] && source "$_MOLE_CORE_DIR/base.sh"
 
+# Timeout for the second key of a multi-key sequence (e.g. gg -> jump to top).
+# Bash 4.0+ accepts fractional `read -t` values; macOS default Bash 3.2 rejects
+# them ("invalid timeout specification") and the read fails instantly, which
+# silently disabled the gg shortcut. Use a snappy sub-second wait where it is
+# supported and fall back to a 1s integer timeout on Bash 3.2.
+if [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]]; then
+    readonly MOLE_KEY_SEQ_TIMEOUT="0.3"
+else
+    readonly MOLE_KEY_SEQ_TIMEOUT="1"
+fi
+
 # Cursor control
 clear_screen() { printf '\033[2J\033[H'; }
 hide_cursor() { [[ -t 1 ]] && printf '\033[?25l' >&2 || true; }
@@ -162,6 +173,47 @@ read_key() {
         return 0
     }
 
+    # Decode terminal sequences once, in both navigation and text-input modes.
+    # Keep the established one-second ESC reads for Bash 3.2.
+    if [[ "$key" == $'\x1b' ]]; then
+        local sequence="" terminator=""
+        if ! IFS= read -r -s -n 1 -t 1 rest 2> /dev/null; then
+            echo "QUIT"
+        elif [[ "$rest" == "[" || "$rest" == "O" ]]; then
+            if ! IFS= read -r -s -n 1 -t 1 sequence 2> /dev/null; then
+                [[ "$rest" == "[" ]] && echo "QUIT" || echo "OTHER"
+            else
+                case "$sequence" in
+                    A) echo "UP" ;;
+                    B) echo "DOWN" ;;
+                    C) echo "RIGHT" ;;
+                    D) echo "LEFT" ;;
+                    H) echo "TOP" ;;
+                    F) echo "BOTTOM" ;;
+                    1 | 3 | 4 | 5 | 6 | 7 | 8)
+                        if [[ "$rest" == "[" ]] && IFS= read -r -s -n 1 -t 1 terminator 2> /dev/null && [[ "$terminator" == "~" ]]; then
+                            case "$sequence" in
+                                1 | 7) echo "TOP" ;;
+                                4 | 8) echo "BOTTOM" ;;
+                                5) echo "LEFT" ;;
+                                6) echo "RIGHT" ;;
+                                3) echo "DELETE" ;;
+                            esac
+                        else
+                            echo "OTHER"
+                        fi
+                        ;;
+                    *) echo "OTHER" ;;
+                esac
+            fi
+        elif [[ "${MOLE_READ_KEY_FORCE_CHAR:-}" == "1" ]]; then
+            echo "QUIT"
+        else
+            echo "OTHER"
+        fi
+        return 0
+    fi
+
     if [[ "${MOLE_READ_KEY_FORCE_CHAR:-}" == "1" ]]; then
         [[ -z "$key" ]] && {
             echo "ENTER"
@@ -171,42 +223,8 @@ read_key() {
             $'\n' | $'\r') echo "ENTER" ;;
             $'\x7f' | $'\x08') echo "DELETE" ;;
             $'\x15') echo "CLEAR_LINE" ;; # Ctrl+U (often mapped from Cmd+Delete in terminals)
-            $'\x1b')
-                if IFS= read -r -s -n 1 -t 1 rest 2> /dev/null; then
-                    if [[ "$rest" == "[" ]]; then
-                        if IFS= read -r -s -n 1 -t 1 rest2 2> /dev/null; then
-                            case "$rest2" in
-                                "A") echo "UP" ;;
-                                "B") echo "DOWN" ;;
-                                "C") echo "RIGHT" ;;
-                                "D") echo "LEFT" ;;
-                                "3")
-                                    IFS= read -r -s -n 1 -t 1 rest3 2> /dev/null
-                                    [[ "$rest3" == "~" ]] && echo "DELETE" || echo "OTHER"
-                                    ;;
-                                *) echo "OTHER" ;;
-                            esac
-                        else
-                            echo "QUIT"
-                        fi
-                    elif [[ "$rest" == "O" ]]; then
-                        if IFS= read -r -s -n 1 -t 1 rest2 2> /dev/null; then
-                            case "$rest2" in
-                                "A") echo "UP" ;;
-                                "B") echo "DOWN" ;;
-                                "C") echo "RIGHT" ;;
-                                "D") echo "LEFT" ;;
-                                *) echo "OTHER" ;;
-                            esac
-                        else echo "OTHER"; fi
-                    else
-                        echo "QUIT"
-                    fi
-                else
-                    echo "QUIT"
-                fi
-                ;;
-            ' ') echo "SPACE" ;; # Allow space in filter mode for selection
+            ' ') echo "SPACE" ;;          # Allow space in filter mode for selection
+            $'\x03') echo "QUIT" ;;
             [[:print:]]) echo "CHAR:$key" ;;
             *) echo "OTHER" ;;
         esac
@@ -223,51 +241,42 @@ read_key() {
         'q' | 'Q') echo "QUIT" ;;
         'R') echo "RETRY" ;;
         'm' | 'M') echo "MORE" ;;
+        'v' | 'V') echo "VERSION" ;;
         'u' | 'U') echo "UPDATE" ;;
         't' | 'T') echo "TOUCHID" ;;
         'j' | 'J') echo "DOWN" ;;
         'k' | 'K') echo "UP" ;;
         'h' | 'H') echo "LEFT" ;;
         'l' | 'L') echo "RIGHT" ;;
+        'G') echo "BOTTOM" ;;
+        'g')
+            if IFS= read -r -s -n 1 -t "$MOLE_KEY_SEQ_TIMEOUT" rest 2> /dev/null; then
+                if [[ "$rest" == "g" ]]; then
+                    echo "TOP"
+                else
+                    echo "OTHER"
+                fi
+            else
+                echo "OTHER"
+            fi
+            ;;
         $'\x03') echo "QUIT" ;;
         $'\x7f' | $'\x08') echo "DELETE" ;;
         $'\x15') echo "CLEAR_LINE" ;; # Ctrl+U
-        $'\x1b')
-            if IFS= read -r -s -n 1 -t 1 rest 2> /dev/null; then
-                if [[ "$rest" == "[" ]]; then
-                    if IFS= read -r -s -n 1 -t 1 rest2 2> /dev/null; then
-                        case "$rest2" in
-                            "A") echo "UP" ;; "B") echo "DOWN" ;;
-                            "C") echo "RIGHT" ;; "D") echo "LEFT" ;;
-                            "3")
-                                IFS= read -r -s -n 1 -t 1 rest3 2> /dev/null
-                                [[ "$rest3" == "~" ]] && echo "DELETE" || echo "OTHER"
-                                ;;
-                            *) echo "OTHER" ;;
-                        esac
-                    else echo "QUIT"; fi
-                elif [[ "$rest" == "O" ]]; then
-                    if IFS= read -r -s -n 1 -t 1 rest2 2> /dev/null; then
-                        case "$rest2" in
-                            "A") echo "UP" ;; "B") echo "DOWN" ;;
-                            "C") echo "RIGHT" ;; "D") echo "LEFT" ;;
-                            *) echo "OTHER" ;;
-                        esac
-                    else echo "OTHER"; fi
-                else echo "OTHER"; fi
-            else echo "QUIT"; fi
-            ;;
         [[:print:]]) echo "CHAR:$key" ;;
         *) echo "OTHER" ;;
     esac
 }
 
 drain_pending_input() {
+    local idle_timeout="${1:-0.01}"
     local drained=0
-    while IFS= read -r -s -n 1 -t 0.01 _ 2> /dev/null; do
+    while IFS= read -r -s -n 1 -t "$idle_timeout" _ 2> /dev/null; do
         drained=$((drained + 1))
         [[ $drained -gt 100 ]] && break
+        idle_timeout="0.01"
     done
+    return 0
 }
 
 # Format menu option display
@@ -286,6 +295,18 @@ show_menu_option() {
 # Background spinner implementation
 INLINE_SPINNER_PID=""
 INLINE_SPINNER_STOP_FILE=""
+INLINE_SPINNER_MSG_FILE=""
+INLINE_SPINNER_CONTROL_DIR=""
+
+create_inline_spinner_control_dir() {
+    ensure_mole_temp_root || return 1
+    local control_root="$MOLE_RESOLVED_TMPDIR"
+
+    [[ -d "$control_root" && ! -L "$control_root" ]] || return 1
+    INLINE_SPINNER_CONTROL_DIR=$(umask 077 && mktemp -d "$control_root/.mole-spinner.XXXXXX") || return 1
+    [[ -d "$INLINE_SPINNER_CONTROL_DIR" && ! -L "$INLINE_SPINNER_CONTROL_DIR" && -O "$INLINE_SPINNER_CONTROL_DIR" ]] || return 1
+    MOLE_TEMP_DIRS+=("$INLINE_SPINNER_CONTROL_DIR")
+}
 
 # Keep spinner message on one line and avoid wrapping/noisy output on narrow terminals.
 format_spinner_message() {
@@ -323,26 +344,53 @@ start_inline_spinner() {
     display_message=$(format_spinner_message "$message")
 
     if [[ -t 1 ]]; then
-        # Create unique stop flag file for this spinner instance
-        INLINE_SPINNER_STOP_FILE="${TMPDIR:-/tmp}/mole_spinner_$$_$RANDOM.stop"
+        if ! create_inline_spinner_control_dir; then
+            echo -n "  ${BLUE}|${NC} $display_message" >&2 || true
+            return 0
+        fi
+
+        INLINE_SPINNER_STOP_FILE="$INLINE_SPINNER_CONTROL_DIR/stop"
+        # Message file lets callers swap the text in place; a stop/start cycle
+        # blanks the line for a frame and reads as flicker.
+        INLINE_SPINNER_MSG_FILE="$INLINE_SPINNER_CONTROL_DIR/message"
+        if ! (umask 077 && set -C && printf '%s\n' "$display_message" > "$INLINE_SPINNER_MSG_FILE") 2> /dev/null; then
+            rmdir "$INLINE_SPINNER_CONTROL_DIR" 2> /dev/null || true
+            INLINE_SPINNER_CONTROL_DIR=""
+            INLINE_SPINNER_STOP_FILE=""
+            INLINE_SPINNER_MSG_FILE=""
+            echo -n "  ${BLUE}|${NC} $display_message" >&2 || true
+            return 0
+        fi
 
         (
             local stop_file="$INLINE_SPINNER_STOP_FILE"
-            local chars
-            chars="$(mo_spinner_chars)"
-            [[ -z "$chars" ]] && chars="|/-\\"
+            local msg_file="$INLINE_SPINNER_MSG_FILE"
+            mo_load_spinner_frames
             local i=0
+            local current_message="$display_message"
+            local next_message=""
 
             # Clear line on first output to prevent text remnants from previous messages
             printf "\r\033[2K" >&2 || true
 
             # Cooperative exit: check for stop file instead of relying on signals
             while [[ ! -f "$stop_file" ]]; do
-                local c="${chars:$((i % ${#chars})):1}"
+                local c="${MO_SPINNER_FRAMES[$((i % ${#MO_SPINNER_FRAMES[@]}))]}"
+                # Re-read the message each frame; erase the line only when the
+                # text changed (a shorter message would leave remnants), and
+                # keep erase + redraw in one write so no blank frame shows.
+                local frame_lead="\r"
+                if [[ -f "$msg_file" && ! -L "$msg_file" && -r "$msg_file" ]]; then
+                    IFS= read -r next_message < "$msg_file" 2> /dev/null || next_message=""
+                    if [[ -n "$next_message" && "$next_message" != "$current_message" ]]; then
+                        current_message="$next_message"
+                        frame_lead="\r\033[2K"
+                    fi
+                fi
                 # Output to stderr to avoid interfering with stdout
-                printf "\r${MOLE_SPINNER_PREFIX:-}${BLUE}%s${NC} %s" "$c" "$display_message" >&2 || break
+                printf "${frame_lead}${MOLE_SPINNER_PREFIX:-}${BLUE}%s${NC} %s" "$c" "$current_message" >&2 || break
                 i=$((i + 1))
-                sleep 0.05
+                /bin/sleep 0.08
             done
 
             # Clean up stop file before exiting
@@ -366,7 +414,7 @@ stop_inline_spinner() {
         # Wait briefly for cooperative exit
         local wait_count=0
         while kill -0 "$INLINE_SPINNER_PID" 2> /dev/null && [[ $wait_count -lt 5 ]]; do
-            sleep 0.05 2> /dev/null || true
+            /bin/sleep 0.05 2> /dev/null || true
             wait_count=$((wait_count + 1))
         done
 
@@ -379,19 +427,60 @@ stop_inline_spinner() {
 
         # Cleanup
         rm -f "$INLINE_SPINNER_STOP_FILE" 2> /dev/null || true
+        rm -f "$INLINE_SPINNER_MSG_FILE" 2> /dev/null || true
+        if [[ -n "$INLINE_SPINNER_CONTROL_DIR" ]]; then
+            rmdir "$INLINE_SPINNER_CONTROL_DIR" 2> /dev/null || true
+        fi
         INLINE_SPINNER_PID=""
         INLINE_SPINNER_STOP_FILE=""
+        INLINE_SPINNER_MSG_FILE=""
+        INLINE_SPINNER_CONTROL_DIR=""
 
         # Clear the line - use \033[2K to clear entire line, not just to end
         [[ -t 1 ]] && printf "\r\033[2K" >&2 || true
     fi
 }
 
+# Swap the text of a running inline spinner without restarting it.
+# Returns 1 when no spinner is active so callers can fall back to starting one.
+update_inline_spinner_message() {
+    local message="$1"
+    [[ -n "$INLINE_SPINNER_PID" && -n "$INLINE_SPINNER_MSG_FILE" && -n "$INLINE_SPINNER_CONTROL_DIR" ]] || return 1
+    kill -0 "$INLINE_SPINNER_PID" 2> /dev/null || return 1
+    [[ -f "$INLINE_SPINNER_MSG_FILE" && ! -L "$INLINE_SPINNER_MSG_FILE" && -O "$INLINE_SPINNER_MSG_FILE" ]] || return 1
+
+    local display_message
+    display_message=$(format_spinner_message "$message")
+
+    # Write-then-rename so the spinner never reads a half-truncated file.
+    local tmp_file
+    tmp_file=$(umask 077 && mktemp "$INLINE_SPINNER_CONTROL_DIR/message.XXXXXX") || return 1
+    if ! printf '%s\n' "$display_message" > "$tmp_file" 2> /dev/null; then
+        rm -f "$tmp_file" 2> /dev/null || true
+        return 1
+    fi
+    if ! mv -f "$tmp_file" "$INLINE_SPINNER_MSG_FILE" 2> /dev/null; then
+        rm -f "$tmp_file" 2> /dev/null || true
+        return 1
+    fi
+    return 0
+}
+
 # Get spinner characters
 mo_spinner_chars() {
-    local chars="|/-\\"
-    [[ -z "$chars" ]] && chars="|/-\\"
-    printf "%s" "$chars"
+    printf "%s\n" "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"
+}
+
+# Fill MO_SPINNER_FRAMES, one frame per element, for every spinner loop.
+# LC_ALL=C makes ${var:i:1} slice bytes, so multibyte frames must never be
+# indexed out of a single string.
+mo_load_spinner_frames() {
+    MO_SPINNER_FRAMES=()
+    local frame=""
+    while IFS= read -r frame; do
+        [[ -n "$frame" ]] && MO_SPINNER_FRAMES[${#MO_SPINNER_FRAMES[@]}]="$frame"
+    done < <(mo_spinner_chars)
+    [[ ${#MO_SPINNER_FRAMES[@]} -gt 0 ]] || MO_SPINNER_FRAMES=("|" "/" "-" "\\")
 }
 
 # Format relative time for compact display (e.g., 3d ago)
