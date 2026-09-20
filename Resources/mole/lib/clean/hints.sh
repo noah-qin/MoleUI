@@ -55,6 +55,106 @@ hint_get_path_size_kb_with_timeout() {
 }
 
 # shellcheck disable=SC2329
+hint_collect_child_dirs_with_timeout() {
+    local parent="$1"
+    local output_file="$2"
+    local timeout_seconds="${3:-1}"
+
+    [[ -d "$parent" ]] || return 1
+    : > "$output_file" || return 1
+
+    # 1s: shallow directory listing should be near-instant on healthy local
+    # paths. Slow/cloud-backed roots are skipped so `mo clean` never appears
+    # stuck while rendering this non-destructive hint.
+    run_with_timeout "$timeout_seconds" find "$parent" -mindepth 1 -maxdepth 1 -type d -print0 > "$output_file" 2> /dev/null
+}
+
+# shellcheck disable=SC2329
+hint_extract_launch_agent_program_path() {
+    local plist="$1"
+    local program=""
+
+    if ! program=$(plutil -extract Program raw "$plist" 2> /dev/null); then
+        program=""
+    fi
+    if [[ -z "$program" ]]; then
+        if ! program=$(plutil -extract ProgramArguments.0 raw "$plist" 2> /dev/null); then
+            program=""
+        fi
+    fi
+
+    printf '%s\n' "$program"
+}
+
+# shellcheck disable=SC2329
+hint_launch_agent_has_mach_services() {
+    local plist="$1"
+    plutil -extract MachServices raw "$plist" > /dev/null 2>&1
+}
+
+# shellcheck disable=SC2329
+hint_extract_launch_agent_associated_bundle() {
+    local plist="$1"
+    local associated=""
+
+    if ! associated=$(plutil -extract AssociatedBundleIdentifiers.0 raw "$plist" 2> /dev/null); then
+        associated=""
+    fi
+    if [[ -z "$associated" ]] || [[ "$associated" == "1" ]]; then
+        if ! associated=$(plutil -extract AssociatedBundleIdentifiers raw "$plist" 2> /dev/null); then
+            associated=""
+        fi
+        if [[ "$associated" == "{"* ]] || [[ "$associated" == "["* ]]; then
+            associated=""
+        fi
+    fi
+
+    printf '%s\n' "$associated"
+}
+
+# shellcheck disable=SC2329
+hint_is_app_scoped_launch_target() {
+    local program="$1"
+
+    case "$program" in
+        /Applications/Setapp/*.app/* | \
+            /Applications/*.app/* | \
+            "$HOME"/Applications/*.app/* | \
+            "$HOME"/Library/Application\ Support/*.app/* | \
+            /Library/Input\ Methods/*.app/* | \
+            /Library/PrivilegedHelperTools/*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# shellcheck disable=SC2329
+hint_is_system_binary() {
+    local program="$1"
+
+    case "$program" in
+        /bin/* | /sbin/* | /usr/bin/* | /usr/sbin/* | /usr/libexec/*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+# shellcheck disable=SC2329
+hint_launch_agent_bundle_exists() {
+    local bundle_id="$1"
+
+    [[ -z "$bundle_id" ]] && return 1
+
+    # Delegate to the shared resolver so Spotlight misses (e.g. KeePassXC
+    # installed via Homebrew) fall back to a direct /Applications scan. See #732.
+    bundle_has_installed_app "$bundle_id"
+}
+
+# shellcheck disable=SC2329
 record_project_artifact_hint() {
     local path="$1"
 
@@ -100,11 +200,21 @@ probe_project_artifact_hints() {
     PROJECT_ARTIFACT_HINT_ESTIMATED_KB=0
     PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES=0
     PROJECT_ARTIFACT_HINT_ESTIMATE_PARTIAL=false
+    PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=false
 
     local max_projects=200
     local max_projects_per_root=0
     local max_nested_per_project=120
     local max_matches=12
+    local list_timeout_seconds=1
+
+    # Wall-clock ceiling for the whole walk. Per-listing finds are already
+    # capped at 1s, but with up to max_projects roots the cumulative scan can
+    # stretch into minutes on busy machines and look hung (#1053). Checked
+    # between iterations so the section degrades gracefully instead of stalling.
+    local hint_budget_seconds="${MOLE_TIMEOUT_HINT_SCAN_SEC:-15}"
+    [[ "$hint_budget_seconds" =~ ^[0-9]+$ ]] || hint_budget_seconds=15
+    local scan_deadline=$((SECONDS + hint_budget_seconds))
 
     local -a target_names=()
     while IFS= read -r target_name; do
@@ -125,18 +235,21 @@ probe_project_artifact_hints() {
     fi
     [[ $max_projects_per_root -gt $max_projects ]] && max_projects_per_root=$max_projects
 
-    local nullglob_was_set=0
-    if shopt -q nullglob; then
-        nullglob_was_set=1
-    fi
-    shopt -s nullglob
-
     local scanned_projects=0
     local stop_scan=false
     local root project_dir nested_dir target_name candidate
+    local project_dirs_file nested_dirs_file
 
     for root in "${scan_roots[@]}"; do
+        if [[ $SECONDS -ge $scan_deadline ]]; then
+            PROJECT_ARTIFACT_HINT_TRUNCATED=true
+            PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=true
+            break
+        fi
         [[ -d "$root" ]] || continue
+        # In-place spinner text swap per root: a multi-second walk with a
+        # static label reads as a hang, a moving path reads as progress.
+        start_section_spinner "Scanning projects · ${root/#$HOME/~}"
         local root_projects_scanned=0
 
         if is_quick_purge_project_root "$root"; then
@@ -162,9 +275,26 @@ probe_project_artifact_hints() {
             continue
         fi
 
-        for project_dir in "$root"/*/; do
+        project_dirs_file=$(mktemp_file "project_artifact_dirs") || {
+            PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=true
+            PROJECT_ARTIFACT_HINT_TRUNCATED=true
+            continue
+        }
+        if ! hint_collect_child_dirs_with_timeout "$root" "$project_dirs_file" "$list_timeout_seconds"; then
+            PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=true
+            PROJECT_ARTIFACT_HINT_TRUNCATED=true
+            rm -f "$project_dirs_file"
+            continue
+        fi
+
+        while IFS= read -r -d '' project_dir; do
+            if [[ $SECONDS -ge $scan_deadline ]]; then
+                PROJECT_ARTIFACT_HINT_TRUNCATED=true
+                PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=true
+                stop_scan=true
+                break
+            fi
             [[ -d "$project_dir" ]] || continue
-            project_dir="${project_dir%/}"
 
             local project_name
             project_name=$(basename "$project_dir")
@@ -191,10 +321,34 @@ probe_project_artifact_hints() {
             done
             [[ "$stop_scan" == "true" ]] && break
 
+            if [[ $SECONDS -ge $scan_deadline ]]; then
+                PROJECT_ARTIFACT_HINT_TRUNCATED=true
+                PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=true
+                stop_scan=true
+                break
+            fi
+
             local nested_count=0
-            for nested_dir in "$project_dir"/*/; do
+            nested_dirs_file=$(mktemp_file "project_artifact_nested") || {
+                PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=true
+                PROJECT_ARTIFACT_HINT_TRUNCATED=true
+                continue
+            }
+            if ! hint_collect_child_dirs_with_timeout "$project_dir" "$nested_dirs_file" "$list_timeout_seconds"; then
+                PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=true
+                PROJECT_ARTIFACT_HINT_TRUNCATED=true
+                rm -f "$nested_dirs_file"
+                continue
+            fi
+
+            while IFS= read -r -d '' nested_dir; do
+                if [[ $SECONDS -ge $scan_deadline ]]; then
+                    PROJECT_ARTIFACT_HINT_TRUNCATED=true
+                    PROJECT_ARTIFACT_HINT_SCAN_SKIPPED=true
+                    stop_scan=true
+                    break
+                fi
                 [[ -d "$nested_dir" ]] || continue
-                nested_dir="${nested_dir%/}"
 
                 local nested_name
                 nested_name=$(basename "$nested_dir")
@@ -217,19 +371,15 @@ probe_project_artifact_hints() {
                         record_project_artifact_hint "$candidate"
                     fi
                 done
-
-                [[ "$stop_scan" == "true" ]] && break
-            done
+            done < "$nested_dirs_file"
+            rm -f "$nested_dirs_file"
 
             [[ "$stop_scan" == "true" ]] && break
-        done
+        done < "$project_dirs_file"
+        rm -f "$project_dirs_file"
 
         [[ "$stop_scan" == "true" ]] && break
     done
-
-    if [[ $nullglob_was_set -eq 0 ]]; then
-        shopt -u nullglob
-    fi
 
     if [[ $PROJECT_ARTIFACT_HINT_COUNT -gt 0 ]]; then
         PROJECT_ARTIFACT_HINT_DETECTED=true
@@ -245,73 +395,19 @@ probe_project_artifact_hints() {
 }
 
 # shellcheck disable=SC2329
-show_system_data_hint_notice() {
-    local min_gb=2
-    local timeout_seconds="0.8"
-    local max_hits=3
-
-    local threshold_kb=$((min_gb * 1024 * 1024))
-    local -a clue_labels=()
-    local -a clue_sizes=()
-    local -a clue_paths=()
-
-    local -a labels=(
-        "Xcode DerivedData"
-        "Xcode Archives"
-        "iPhone backups"
-        "Simulator data"
-        "Docker Desktop data"
-        "Mail data"
-    )
-    local -a paths=(
-        "$HOME/Library/Developer/Xcode/DerivedData"
-        "$HOME/Library/Developer/Xcode/Archives"
-        "$HOME/Library/Application Support/MobileSync/Backup"
-        "$HOME/Library/Developer/CoreSimulator/Devices"
-        "$HOME/Library/Containers/com.docker.docker/Data"
-        "$HOME/Library/Mail"
-    )
-
-    local i
-    for i in "${!paths[@]}"; do
-        local path="${paths[$i]}"
-        [[ -d "$path" ]] || continue
-
-        local size_kb=""
-        if size_kb=$(hint_get_path_size_kb_with_timeout "$path" "$timeout_seconds"); then
-            if [[ "$size_kb" -ge "$threshold_kb" ]]; then
-                clue_labels+=("${labels[$i]}")
-                clue_sizes+=("$size_kb")
-                clue_paths+=("${path/#$HOME/~}")
-                if [[ ${#clue_labels[@]} -ge $max_hits ]]; then
-                    break
-                fi
-            fi
-        fi
-    done
-
-    if [[ ${#clue_labels[@]} -eq 0 ]]; then
-        note_activity
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No common System Data clues detected"
-        return 0
-    fi
-
-    note_activity
-
-    for i in "${!clue_labels[@]}"; do
-        local human_size
-        human_size=$(bytes_to_human "$((clue_sizes[i] * 1024))")
-        echo -e "  ${GREEN}${ICON_LIST}${NC} ${clue_labels[$i]}: ${human_size}"
-        echo -e "  ${GRAY}${ICON_SUBLIST}${NC} Path: ${GRAY}${clue_paths[$i]}${NC}"
-    done
-    echo -e "  ${GRAY}${ICON_REVIEW}${NC} Review: mo analyze, Device backups, docker system df"
-}
-
-# shellcheck disable=SC2329
 show_project_artifact_hint_notice() {
+    # The probe walks up to 200 project roots and du-samples candidates under
+    # a 15s budget; without a loading state the section title just sits there
+    # and the result row pops out of nowhere.
+    start_section_spinner "Scanning project artifacts..."
     probe_project_artifact_hints
+    stop_section_spinner
 
     if [[ "$PROJECT_ARTIFACT_HINT_DETECTED" != "true" ]]; then
+        if [[ "${PROJECT_ARTIFACT_HINT_SCAN_SKIPPED:-false}" == "true" ]]; then
+            note_activity
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Build artifacts · scan skipped · ${GRAY}mo purge${NC}"
+        fi
         return 0
     fi
 
@@ -320,14 +416,13 @@ show_project_artifact_hint_notice() {
     local hint_count_label="$PROJECT_ARTIFACT_HINT_COUNT"
     [[ "$PROJECT_ARTIFACT_HINT_TRUNCATED" == "true" ]] && hint_count_label="${hint_count_label}+"
 
-    local example_text=""
-    if [[ ${#PROJECT_ARTIFACT_HINT_EXAMPLES[@]} -gt 0 ]]; then
-        example_text="${PROJECT_ARTIFACT_HINT_EXAMPLES[0]}"
-        if [[ ${#PROJECT_ARTIFACT_HINT_EXAMPLES[@]} -gt 1 ]]; then
-            example_text+=", ${PROJECT_ARTIFACT_HINT_EXAMPLES[1]}"
-        fi
+    local review_command="mo purge"
+    if [[ $PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES -gt 0 && $PROJECT_ARTIFACT_HINT_ESTIMATED_KB -eq 0 ]]; then
+        review_command="mo purge --include-empty"
     fi
 
+    # One compact row: "Build artifacts · 15+ dirs, 985.6MB+ · mo purge".
+    local detail="${hint_count_label} dirs"
     if [[ $PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES -gt 0 ]]; then
         local estimate_human
         estimate_human=$(bytes_to_human "$((PROJECT_ARTIFACT_HINT_ESTIMATED_KB * 1024))")
@@ -338,16 +433,86 @@ show_project_artifact_hint_notice() {
         fi
 
         if [[ "$estimate_is_partial" == "true" ]]; then
-            echo -e "  ${GREEN}${ICON_LIST}${NC} ${GREEN}${hint_count_label}${NC} candidates, at least ${estimate_human} sampled from ${PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES} items"
+            detail+=", ${estimate_human}+"
         else
-            echo -e "  ${GREEN}${ICON_LIST}${NC} ${GREEN}${hint_count_label}${NC} candidates, sampled ${estimate_human}"
+            detail+=", ${estimate_human}"
         fi
-    else
-        echo -e "  ${GREEN}${ICON_LIST}${NC} ${GREEN}${hint_count_label}${NC} candidates"
     fi
 
-    if [[ -n "$example_text" ]]; then
-        echo -e "  ${GRAY}${ICON_SUBLIST}${NC} Examples: ${GRAY}${example_text}${NC}"
+    local partial_note=""
+    if [[ "${PROJECT_ARTIFACT_HINT_SCAN_SKIPPED:-false}" == "true" ]]; then
+        partial_note=" ${GRAY}(partial scan)${NC}"
     fi
-    echo -e "  ${GRAY}${ICON_REVIEW}${NC} Review: mo purge"
+
+    echo -e "  ${YELLOW}${ICON_REVIEW}${NC} Build artifacts · ${GREEN}${detail}${NC} · ${GRAY}${review_command}${NC}${partial_note}"
+}
+
+# shellcheck disable=SC2329
+show_user_launch_agent_hint_notice() {
+    local launch_agents_dir="$HOME/Library/LaunchAgents"
+    [[ -d "$launch_agents_dir" ]] || return 0
+
+    local max_hits=3
+    local -a sources=()
+    local -a reasons=()
+    local -a targets=()
+    local plist
+
+    # Per-plist target probes add up; keep loading feedback on screen.
+    start_section_spinner "Checking login items..."
+
+    while IFS= read -r -d '' plist; do
+        local filename
+        filename=$(basename "$plist")
+        [[ "$filename" == com.apple.* ]] && continue
+
+        local reason=""
+        local target=""
+        local program=""
+        local associated=""
+
+        program=$(hint_extract_launch_agent_program_path "$plist")
+        if [[ -z "$program" ]] && hint_launch_agent_has_mach_services "$plist"; then
+            continue
+        fi
+        if [[ -n "$program" ]] && hint_is_system_binary "$program"; then
+            continue
+        fi
+        if [[ "$program" == /* && -f "$program" && -x "$program" ]]; then
+            continue
+        elif [[ -n "$program" ]] && hint_is_app_scoped_launch_target "$program"; then
+            if [[ ! -e "$program" ]]; then
+                reason="Missing app/helper target"
+                target="${program/#$HOME/~}"
+            elif [[ ! -f "$program" || ! -x "$program" ]]; then
+                reason="Program target is not executable"
+                target="${program/#$HOME/~}"
+            fi
+        else
+            associated=$(hint_extract_launch_agent_associated_bundle "$plist")
+            if [[ -n "$associated" ]] && ! hint_launch_agent_bundle_exists "$associated"; then
+                reason="Associated app not found"
+                target="$associated"
+            fi
+        fi
+
+        if [[ -n "$reason" ]]; then
+            sources+=("${plist/#$HOME/~}")
+            reasons+=("$reason")
+            targets+=("$target")
+            if [[ ${#sources[@]} -ge $max_hits ]]; then
+                break
+            fi
+        fi
+    done < <(find "$launch_agents_dir" -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
+
+    stop_section_spinner
+    [[ ${#sources[@]} -eq 0 ]] && return 0
+
+    note_activity
+
+    local i
+    for i in "${!sources[@]}"; do
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Stale login item · ${sources[$i]} · ${GRAY}${reasons[$i]}: ${targets[$i]} · review before removing${NC}"
+    done
 }

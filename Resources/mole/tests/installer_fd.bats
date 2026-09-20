@@ -20,13 +20,20 @@ setup_file() {
 }
 
 teardown_file() {
-    rm -rf "$HOME"
+    if [[ "$HOME" == "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+        rm -rf "$HOME"
+    fi
     if [[ -n "${ORIGINAL_HOME:-}" ]]; then
         export HOME="$ORIGINAL_HOME"
     fi
 }
 
 setup() {
+    # Safety: refuse to operate on a real home directory.
+    if [[ "$HOME" != "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+        printf 'FATAL: HOME is not a test temp dir: %s\n' "$HOME" >&2
+        return 1
+    fi
     export TERM="xterm-256color"
     export MO_DEBUG=0
 
@@ -54,7 +61,7 @@ require_fd() {
 
     touch "$HOME/Downloads/Chrome.dmg"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -74,16 +81,16 @@ require_fd() {
     touch "$HOME/Downloads/App3.iso"
     touch "$HOME/Downloads/App.mpkg"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
     ' bash "$PROJECT_ROOT/bin/installer.sh" "$HOME/Downloads"
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"App1.dmg"* ]]
-    [[ "$output" == *"App2.pkg"* ]]
-    [[ "$output" == *"App3.iso"* ]]
+    [[ "$output" == *"App1.dmg"* ]] || return 1
+    [[ "$output" == *"App2.pkg"* ]] || return 1
+    [[ "$output" == *"App3.iso"* ]] || return 1
     [[ "$output" == *"App.mpkg"* ]]
 }
 
@@ -98,7 +105,7 @@ require_fd() {
     touch "$HOME/Downloads/level1/level2/deep.dmg"
     touch "$HOME/Downloads/level1/level2/level3/too-deep.dmg"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -106,9 +113,9 @@ require_fd() {
 
     [ "$status" -eq 0 ]
     # Default max depth is 2
-    [[ "$output" == *"shallow.dmg"* ]]
-    [[ "$output" == *"mid.dmg"* ]]
-    [[ "$output" == *"deep.dmg"* ]]
+    [[ "$output" == *"shallow.dmg"* ]] || return 1
+    [[ "$output" == *"mid.dmg"* ]] || return 1
+    [[ "$output" == *"deep.dmg"* ]] || return 1
     [[ "$output" != *"too-deep.dmg"* ]]
 }
 
@@ -121,14 +128,14 @@ require_fd() {
     touch "$HOME/Downloads/top.dmg"
     touch "$HOME/Downloads/level1/nested.dmg"
 
-    run env MOLE_INSTALLER_SCAN_MAX_DEPTH=1 bash -euo pipefail -c "
+    run env MOLE_INSTALLER_SCAN_MAX_DEPTH=1 /bin/bash -euo pipefail -c "
         export MOLE_TEST_MODE=1
         source \"\$1\"
         scan_installers_in_path \"\$2\"
     " bash "$PROJECT_ROOT/bin/installer.sh" "$HOME/Downloads"
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"top.dmg"* ]]
+    [[ "$output" == *"top.dmg"* ]] || return 1
     [[ "$output" != *"nested.dmg"* ]]
 }
 
@@ -137,7 +144,7 @@ require_fd() {
         return 0
     fi
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -157,16 +164,16 @@ require_fd() {
     touch "$HOME/Downloads/archive.tar.gz"
     touch "$HOME/Downloads/Installer.dmg"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
     ' bash "$PROJECT_ROOT/bin/installer.sh" "$HOME/Downloads"
 
     [ "$status" -eq 0 ]
-    [[ "$output" != *"document.pdf"* ]]
-    [[ "$output" != *"image.jpg"* ]]
-    [[ "$output" != *"archive.tar.gz"* ]]
+    [[ "$output" != *"document.pdf"* ]] || return 1
+    [[ "$output" != *"image.jpg"* ]] || return 1
+    [[ "$output" != *"archive.tar.gz"* ]] || return 1
     [[ "$output" == *"Installer.dmg"* ]]
 }
 
@@ -177,7 +184,7 @@ require_fd() {
 
     touch "$HOME/Downloads/My App Installer.dmg"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -194,7 +201,7 @@ require_fd() {
 
     touch "$HOME/Downloads/App-v1.2.3_beta.pkg"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -213,7 +220,7 @@ require_fd() {
     touch "$HOME/Downloads/document.pdf"
     touch "$HOME/Downloads/image.png"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -232,14 +239,14 @@ require_fd() {
     ln -s "$HOME/Downloads/real.dmg" "$HOME/Downloads/symlink.dmg"
     ln -s /nonexistent "$HOME/Downloads/dangling.lnk"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
     ' bash "$PROJECT_ROOT/bin/installer.sh" "$HOME/Downloads"
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"real.dmg"* ]]
-    [[ "$output" != *"symlink.dmg"* ]]
+    [[ "$output" == *"real.dmg"* ]] || return 1
+    [[ "$output" != *"symlink.dmg"* ]] || return 1
     [[ "$output" != *"dangling.lnk"* ]]
 }
