@@ -6,79 +6,87 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   format:
     name: Format
     runs-on: macos-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
-        with:
-          ref: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref) || github.ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Cache Homebrew
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/Library/Caches/Homebrew
-            /usr/local/Cellar/shfmt
             /usr/local/Cellar/shellcheck
             /usr/local/Cellar/golangci-lint
           key: ${{ runner.os }}-brew-quality-v2-${{ hashFiles('**/Brewfile') }}
           restore-keys: |
             ${{ runner.os }}-brew-quality-v2-
 
-      - name: Install tools
-        run: brew install shfmt shellcheck golangci-lint
-
       - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24.6'
+          go-version-file: go.mod
+
+      - name: Install tools
+        run: |
+          brew install shellcheck
+          go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Install goimports
-        run: go install golang.org/x/tools/cmd/goimports@latest
+        run: go install golang.org/x/tools/cmd/goimports@v0.49.0
 
-      - name: Format all code
+      - name: Check shell formatting (shfmt -d)
+        run: |
+          SHELL_FILES=$(find . -type f \( -name "*.sh" -o -name "mole" \) \
+            -not -path "./.git/*" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/tests/tmp-*/*" \
+            -not -path "*/.*")
+          if ! echo "$SHELL_FILES" | xargs shfmt -i 4 -ci -sr -d; then
+            echo "::error::Shell files are not formatted. Run './scripts/check.sh --format' locally and commit."
+            exit 1
+          fi
+
+      - name: Check Go formatting (goimports -l)
         run: |
           export PATH=$(go env GOPATH)/bin:$PATH
-          ./scripts/check.sh --format
-
-      - name: Commit formatting changes
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        run: |
-          git config user.name "Tw93"
-          git config user.email "tw93@qq.com"
-          if [[ -n $(git status --porcelain) ]]; then
-            git add .
-            git commit -m "chore: auto format code"
-            git push
-            echo "✓ Formatting changes committed"
-          else
-            echo "✓ No formatting changes needed"
+          UNFORMATTED=$(goimports -l -local github.com/tw93/mole ./cmd ./internal)
+          if [[ -n "$UNFORMATTED" ]]; then
+            echo "::error::Go files are not formatted:"
+            echo "$UNFORMATTED"
+            echo "Run './scripts/check.sh --format' locally and commit."
+            exit 1
           fi
 
   quality:
     name: Check
     runs-on: macos-latest
+    timeout-minutes: 20
     needs: format
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
-        with:
-          ref: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref) || github.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Cache Homebrew
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/Library/Caches/Homebrew
-            /usr/local/Cellar/shfmt
             /usr/local/Cellar/shellcheck
             /usr/local/Cellar/golangci-lint
           key: ${{ runner.os }}-brew-quality-v2-${{ hashFiles('**/Brewfile') }}
@@ -86,12 +94,17 @@ jobs:
             ${{ runner.os }}-brew-quality-v2-
 
       - name: Install tools
-        run: brew install shfmt shellcheck golangci-lint
+        run: brew install shellcheck
 
       - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24.6'
+          go-version-file: go.mod
+
+      - name: Install golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run check script
         run: ./scripts/check.sh --no-format

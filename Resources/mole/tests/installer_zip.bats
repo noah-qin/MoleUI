@@ -1,16 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-installers-home.XXXXXX")"
-    export HOME
-
-    mkdir -p "$HOME"
+    mole_test_setup_home installers-home
 
     if command -v zip > /dev/null 2>&1; then
         ZIP_AVAILABLE=1
@@ -30,13 +23,15 @@ setup_file() {
 }
 
 teardown_file() {
-    rm -rf "$HOME"
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 setup() {
+    # Safety: refuse to operate on a real home directory.
+    if [[ "$HOME" != "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+        printf 'FATAL: HOME is not a test temp dir: %s\n' "$HOME" >&2
+        return 1
+    fi
     export TERM="xterm-256color"
     export MO_DEBUG=0
 
@@ -85,7 +80,7 @@ require_unzip_support() {
     done
     (cd "$HOME/Downloads" && zip -q -r large-installer.zip large-app)
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         if is_installer_zip "'"$HOME/Downloads/large-installer.zip"'"; then
@@ -108,7 +103,7 @@ require_unzip_support() {
     touch "$HOME/Downloads/app-content/MyApp.app"
     (cd "$HOME/Downloads" && zip -q -r app.zip app-content)
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         if is_installer_zip "'"$HOME/Downloads/app.zip"'"; then
@@ -137,7 +132,7 @@ require_unzip_support() {
     touch "$HOME/Downloads/deep-content/MyApp.app"
     (cd "$HOME/Downloads" && zip -q -r deep.zip deep-content)
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         if is_installer_zip "'"$HOME/Downloads/deep.zip"'"; then
@@ -173,7 +168,7 @@ require_unzip_support() {
 EOF
     (cd "$HOME/Downloads" && zip -q -r realapp.zip RealApp.app)
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         if is_installer_zip "'"$HOME/Downloads/realapp.zip"'"; then
@@ -197,7 +192,7 @@ EOF
     touch "$HOME/Downloads/data/file2.pdf"
     (cd "$HOME/Downloads" && zip -q -r data.zip data)
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         if is_installer_zip "'"$HOME/Downloads/data.zip"'"; then
@@ -214,7 +209,7 @@ EOF
 @test "is_installer_zip: returns NOT_INSTALLER when ZIP list command is unavailable" {
     touch "$HOME/Downloads/empty.zip"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         ZIP_LIST_CMD=()
@@ -238,7 +233,7 @@ EOF
     touch "$HOME/Downloads/app-content/MyApp.app"
     (cd "$HOME/Downloads" && zip -q -r app.zip app-content)
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         ZIP_LIST_CMD=(unzip -Z -1)
@@ -265,7 +260,7 @@ EOF
     touch "$HOME/Downloads/app-content/MyApp.app"
     (cd "$HOME/Downloads" && zip -q -r installer.zip app-content)
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_all_installers
@@ -286,7 +281,7 @@ EOF
     touch "$HOME/Downloads/data/file2.pdf"
     (cd "$HOME/Downloads" && zip -q -r data.zip data)
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_all_installers
@@ -306,7 +301,7 @@ EOF
     # Create a corrupt ZIP file by just writing garbage data
     echo "This is not a valid ZIP file" > "$HOME/Downloads/corrupt.zip"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -336,7 +331,7 @@ EOF
     # Remove read permissions from restricted.zip
     chmod 000 "$HOME/Downloads/restricted.zip"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -344,8 +339,8 @@ EOF
 
     # Should succeed and find the readable.zip but skip restricted.zip
     [ "$status" -eq 0 ]
-    [[ "$output" == *"readable.zip"* ]]
-    [[ "$output" != *"restricted.zip"* ]]
+    [[ "$output" == *"readable.zip"* ]] || return 1
+    [[ "$output" != *"restricted.zip"* ]] || return 1
 
     # Cleanup: restore permissions for teardown
     chmod 644 "$HOME/Downloads/restricted.zip"
@@ -364,7 +359,7 @@ EOF
     # Create a corrupt ZIP
     echo "garbage data" > "$HOME/Downloads/corrupt.zip"
 
-    run bash -euo pipefail -c '
+    run /bin/bash -euo pipefail -c '
         export MOLE_TEST_MODE=1
         source "$1"
         scan_installers_in_path "$2"
@@ -372,6 +367,6 @@ EOF
 
     # Should find the valid ZIP and silently skip the corrupt one
     [ "$status" -eq 0 ]
-    [[ "$output" == *"valid-installer.zip"* ]]
+    [[ "$output" == *"valid-installer.zip"* ]] || return 1
     [[ "$output" != *"corrupt.zip"* ]]
 }

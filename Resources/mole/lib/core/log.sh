@@ -21,9 +21,9 @@ fi
 # Logging Configuration
 # ============================================================================
 
-readonly LOG_FILE="${HOME}/.config/mole/mole.log"
-readonly DEBUG_LOG_FILE="${HOME}/.config/mole/mole_debug_session.log"
-readonly OPERATIONS_LOG_FILE="${HOME}/.config/mole/operations.log"
+readonly LOG_FILE="${HOME}/Library/Logs/mole/mole.log"
+readonly DEBUG_LOG_FILE="${HOME}/Library/Logs/mole/mole_debug_session.log"
+readonly OPERATIONS_LOG_FILE="${HOME}/Library/Logs/mole/operations.log"
 readonly LOG_MAX_SIZE_DEFAULT=1048576   # 1MB
 readonly OPLOG_MAX_SIZE_DEFAULT=5242880 # 5MB
 
@@ -36,6 +36,22 @@ fi
 # ============================================================================
 # Log Rotation
 # ============================================================================
+
+append_log_line() {
+    local file_path="$1"
+    local line="${2:-}"
+
+    ensure_user_file "$file_path"
+    printf '%s\n' "$line" >> "$file_path" 2> /dev/null || true
+}
+
+append_log_lines() {
+    local file_path="$1"
+    shift
+
+    ensure_user_file "$file_path"
+    printf '%s\n' "$@" >> "$file_path" 2> /dev/null || true
+}
 
 # Rotate log file if it exceeds maximum size
 rotate_log_once() {
@@ -76,58 +92,108 @@ get_timestamp() {
     date '+%Y-%m-%d %H:%M:%S'
 }
 
+# Any log row printed inside a section counts as section activity; without
+# this, a section whose rows come only from log_* helpers is misdetected as
+# idle and end_section/start_section reclaim lines that hold real output.
+_log_mark_section_activity() {
+    # Purge deliberately gives note_activity a different export side effect.
+    # Update the stable section state directly so logging never dispatches to
+    # a source-order-selected command implementation.
+    if [[ "${TRACK_SECTION:-0}" == "1" ]]; then
+        SECTION_ACTIVITY=1
+    fi
+}
+
 # Log informational message
 log_info() {
     echo -e "${BLUE}$1${NC}"
+    _log_mark_section_activity
     local timestamp
     timestamp=$(get_timestamp)
-    echo "[$timestamp] INFO: $1" >> "$LOG_FILE" 2> /dev/null || true
+    append_log_line "$LOG_FILE" "[$timestamp] INFO: $1"
     if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        echo "[$timestamp] INFO: $1" >> "$DEBUG_LOG_FILE" 2> /dev/null || true
+        append_log_line "$DEBUG_LOG_FILE" "[$timestamp] INFO: $1"
     fi
 }
 
 # Log success message
 log_success() {
     echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $1"
+    _log_mark_section_activity
     local timestamp
     timestamp=$(get_timestamp)
-    echo "[$timestamp] SUCCESS: $1" >> "$LOG_FILE" 2> /dev/null || true
+    append_log_line "$LOG_FILE" "[$timestamp] SUCCESS: $1"
     if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        echo "[$timestamp] SUCCESS: $1" >> "$DEBUG_LOG_FILE" 2> /dev/null || true
+        append_log_line "$DEBUG_LOG_FILE" "[$timestamp] SUCCESS: $1"
     fi
 }
 
 # shellcheck disable=SC2329
 log_warning() {
     echo -e "${YELLOW}$1${NC}"
+    _log_mark_section_activity
     local timestamp
     timestamp=$(get_timestamp)
-    echo "[$timestamp] WARNING: $1" >> "$LOG_FILE" 2> /dev/null || true
+    append_log_line "$LOG_FILE" "[$timestamp] WARNING: $1"
     if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        echo "[$timestamp] WARNING: $1" >> "$DEBUG_LOG_FILE" 2> /dev/null || true
+        append_log_line "$DEBUG_LOG_FILE" "[$timestamp] WARNING: $1"
     fi
 }
 
 # shellcheck disable=SC2329
 log_error() {
     echo -e "${YELLOW}${ICON_ERROR}${NC} $1" >&2
+    _log_mark_section_activity
     local timestamp
     timestamp=$(get_timestamp)
-    echo "[$timestamp] ERROR: $1" >> "$LOG_FILE" 2> /dev/null || true
+    append_log_line "$LOG_FILE" "[$timestamp] ERROR: $1"
     if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        echo "[$timestamp] ERROR: $1" >> "$DEBUG_LOG_FILE" 2> /dev/null || true
+        append_log_line "$DEBUG_LOG_FILE" "[$timestamp] ERROR: $1"
     fi
 }
 
 # shellcheck disable=SC2329
 debug_log() {
     if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        echo -e "${GRAY}[DEBUG]${NC} $*" >&2
+        printf '%b%s\n' "${GRAY}[DEBUG]${NC} " "$*" >&2
         local timestamp
         timestamp=$(get_timestamp)
-        echo "[$timestamp] DEBUG: $*" >> "$DEBUG_LOG_FILE" 2> /dev/null || true
+        append_log_line "$DEBUG_LOG_FILE" "[$timestamp] DEBUG: $*"
     fi
+}
+
+mole_terminal_safe_text() {
+    local value="${1:-}"
+    value=$(printf '%s' "$value" |
+        LC_ALL=C tr '\r\n\t' '   ' |
+        LC_ALL=C tr '\001-\010\013\014\016-\037\177' '?') || value=""
+    printf '%s' "$value"
+}
+
+# Phase-level performance timing, gated behind MO_DEBUG=1.
+# Uses perl for millisecond precision; falls back to date +%s.
+debug_timer_start() {
+    [[ "${MO_DEBUG:-}" != "1" ]] && return 0
+    local varname="$1"
+    local ts
+    ts=$(perl -MTime::HiRes -e 'printf "%.3f\n", Time::HiRes::time()' 2> /dev/null || date +%s)
+    # eval: indirect write by name; bash 3.2 has no nameref
+    eval "$varname=$ts"
+}
+
+debug_timer_end() {
+    [[ "${MO_DEBUG:-}" != "1" ]] && return 0
+    local label="$1"
+    local start_var="$2"
+    local start_ts
+    # eval: indirect read by name; bash 3.2 has no nameref
+    eval "start_ts=\$$start_var"
+    [[ -z "$start_ts" ]] && return 0
+    local end_ts
+    end_ts=$(perl -MTime::HiRes -e 'printf "%.3f\n", Time::HiRes::time()' 2> /dev/null || date +%s)
+    local elapsed
+    elapsed=$(perl -e "printf '%.3f', $end_ts - $start_ts" 2> /dev/null || echo "$((end_ts - start_ts))")
+    debug_log "PERF [$label] ${elapsed}s"
 }
 
 # ============================================================================
@@ -163,7 +229,7 @@ log_operation() {
     local log_line="[$timestamp] [$command] $action $path"
     [[ -n "$detail" ]] && log_line+=" ($detail)"
 
-    echo "$log_line" >> "$OPERATIONS_LOG_FILE" 2> /dev/null || true
+    append_log_line "$OPERATIONS_LOG_FILE" "$log_line"
 }
 
 # Log session start marker
@@ -175,10 +241,10 @@ log_operation_session_start() {
     local timestamp
     timestamp=$(get_timestamp)
 
-    {
-        echo ""
-        echo "# ========== $command session started at $timestamp =========="
-    } >> "$OPERATIONS_LOG_FILE" 2> /dev/null || true
+    append_log_lines \
+        "$OPERATIONS_LOG_FILE" \
+        "" \
+        "# ========== $command session started at $timestamp =========="
 }
 
 # shellcheck disable=SC2329
@@ -198,9 +264,9 @@ log_operation_session_end() {
         size_human="0B"
     fi
 
-    {
-        echo "# ========== $command session ended at $timestamp, $items items, $size_human =========="
-    } >> "$OPERATIONS_LOG_FILE" 2> /dev/null || true
+    append_log_line \
+        "$OPERATIONS_LOG_FILE" \
+        "# ========== $command session ended at $timestamp, $items items, $size_human =========="
 }
 
 # Enhanced debug logging for operations
@@ -214,11 +280,18 @@ debug_operation_start() {
         [[ -n "$operation_desc" ]] && echo -e "${GRAY}[DEBUG] $operation_desc${NC}" >&2
 
         # Also log to file
-        {
-            echo ""
-            echo "=== $operation_name ==="
-            [[ -n "$operation_desc" ]] && echo "Description: $operation_desc"
-        } >> "$DEBUG_LOG_FILE" 2> /dev/null || true
+        if [[ -n "$operation_desc" ]]; then
+            append_log_lines \
+                "$DEBUG_LOG_FILE" \
+                "" \
+                "=== $operation_name ===" \
+                "Description: $operation_desc"
+        else
+            append_log_lines \
+                "$DEBUG_LOG_FILE" \
+                "" \
+                "=== $operation_name ==="
+        fi
     fi
 }
 
@@ -232,7 +305,7 @@ debug_operation_detail() {
         echo -e "${GRAY}[DEBUG] $detail_type: $detail_value${NC}" >&2
 
         # Also log to file
-        echo "$detail_type: $detail_value" >> "$DEBUG_LOG_FILE" 2> /dev/null || true
+        append_log_line "$DEBUG_LOG_FILE" "$detail_type: $detail_value"
     fi
 }
 
@@ -252,7 +325,7 @@ debug_file_action() {
         echo -e "${GRAY}[DEBUG] $action: $msg${NC}" >&2
 
         # Also log to file
-        echo "$action: $msg" >> "$DEBUG_LOG_FILE" 2> /dev/null || true
+        append_log_line "$DEBUG_LOG_FILE" "$action: $msg"
     fi
 }
 
@@ -303,8 +376,10 @@ log_system_info() {
         fi
         echo "Shell: ${SHELL:-unknown}, ${TERM:-unknown}"
 
-        # Check sudo status non-interactively
-        if sudo -n true 2> /dev/null; then
+        # Check sudo status non-interactively (skip in test mode)
+        if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
+            echo "Sudo Access: Skipped (test mode)"
+        elif sudo -n true 2> /dev/null; then
             echo "Sudo Access: Active"
         else
             echo "Sudo Access: Required"
@@ -314,33 +389,6 @@ log_system_info() {
 
     # Notification to stderr
     echo -e "${GRAY}[DEBUG] Debug logging enabled. Session log: $DEBUG_LOG_FILE${NC}" >&2
-}
-
-# ============================================================================
-# Command Execution Wrappers
-# ============================================================================
-
-# Run command silently (ignore errors)
-run_silent() {
-    "$@" > /dev/null 2>&1 || true
-}
-
-# Run command with error logging
-run_logged() {
-    local cmd="$1"
-    # Log to main file, and also to debug file if enabled
-    if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        if ! "$@" 2>&1 | tee -a "$LOG_FILE" | tee -a "$DEBUG_LOG_FILE" > /dev/null; then
-            log_warning "Command failed: $cmd"
-            return 1
-        fi
-    else
-        if ! "$@" 2>&1 | tee -a "$LOG_FILE" > /dev/null; then
-            log_warning "Command failed: $cmd"
-            return 1
-        fi
-    fi
-    return 0
 }
 
 # ============================================================================

@@ -1,11 +1,21 @@
+//go:build darwin
+
 package main
 
 import (
 	"fmt"
+	"math"
 	"os"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/tw93/mole/internal/units"
 )
+
+// Left-aligned block elements filling 1/8 through 7/8 of a cell, indexed by
+// eighths. Index 0 is unused: no eighths means nothing to draw.
+var subCellBlocks = [8]string{"", "▏", "▎", "▍", "▌", "▋", "▊", "▉"}
 
 func displayPath(path string) string {
 	home, err := os.UserHomeDir()
@@ -54,8 +64,8 @@ func truncateMiddle(s string, maxWidth int) string {
 
 	tailWidth := 0
 	tailIdx := len(runes)
-	for i := len(runes) - 1; i >= 0; i-- {
-		w := runeWidth(runes[i])
+	for i, r := range slices.Backward(runes) {
+		w := runeWidth(r)
 		if tailWidth+w > targetTailWidth {
 			break
 		}
@@ -77,28 +87,26 @@ func formatNumber(n int64) string {
 }
 
 func humanizeBytes(size int64) string {
-	if size < 0 {
-		return "0 B"
+	return units.BytesSI(size)
+}
+
+func formatPercent(percent float64, known bool) string {
+	const width = 6
+	if !known {
+		return "  --  "
 	}
-	const unit = 1000
-	if size < unit {
-		return fmt.Sprintf("%d B", size)
+
+	label := fmt.Sprintf("%.1f%%", percent)
+	if percent > 0 && percent < 0.1 {
+		label = "< 0.1%"
 	}
-	div, exp := int64(unit), 0
-	for n := size / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	value := float64(size) / float64(div)
-	return fmt.Sprintf("%.1f %cB", value, "kMGTPE"[exp])
+	return fmt.Sprintf("%*s", width, label)
 }
 
 func coloredProgressBar(value, maxValue int64, percent float64) string {
-	if maxValue <= 0 {
-		return colorGray + strings.Repeat("░", barWidth) + colorReset
+	if value <= 0 || maxValue <= 0 {
+		return strings.Repeat(" ", barWidth)
 	}
-
-	filled := min(int((value*int64(barWidth))/maxValue), barWidth)
 
 	var barColor string
 	if percent >= 50 {
@@ -111,27 +119,43 @@ func coloredProgressBar(value, maxValue int64, percent float64) string {
 		barColor = colorGreen
 	}
 
+	// Length is measured in eighths of a cell throughout, so one ruler covers
+	// the whole range. Mixing shaded blocks for the remainder with width blocks
+	// below one cell made a 2.3% row look lighter than a 1.3% one, because the
+	// two glyph families encode magnitude differently.
+	//
+	// The ratio is taken in float64 rather than scaling the byte count first:
+	// value * barWidth * 8 overflows int64 at 42.7 PB and wraps negative, which
+	// reaches strings.Repeat with a negative count and panics. float64 carries
+	// far more precision than 192 distinct lengths need.
+	eighths := max(int64(math.Round(float64(value)/float64(maxValue)*float64(barWidth)*8)), 0)
+	full := int(eighths / 8)
+	remainder := int(eighths % 8)
+	if full >= barWidth {
+		return barColor + strings.Repeat("█", barWidth) + colorReset
+	}
+
+	if full == 0 && remainder == 0 {
+		// Under an eighth of a cell there is no honest length left to draw, but
+		// the row still holds a real value and an empty column reads as a
+		// rendering fault. A gray tick holds the place without competing with
+		// the bars above it, which is what the old colored sliver did: stacked
+		// down a long tail it formed a bright vertical rule over the least
+		// significant rows.
+		return colorGray + subCellBlocks[1] + strings.Repeat(" ", barWidth-1) + colorReset
+	}
+
 	var bar strings.Builder
 	bar.WriteString(barColor)
-	for i := range barWidth {
-		if i < filled {
-			if i < filled-1 {
-				bar.WriteString("█")
-			} else {
-				remainder := (value * int64(barWidth)) % maxValue
-				if remainder > maxValue/2 {
-					bar.WriteString("█")
-				} else if remainder > maxValue/4 {
-					bar.WriteString("▓")
-				} else {
-					bar.WriteString("▒")
-				}
-			}
-		} else {
-			bar.WriteString(colorGray + "░" + barColor)
-		}
+	bar.WriteString(strings.Repeat("█", full))
+	drawn := full
+	if remainder > 0 {
+		bar.WriteString(subCellBlocks[remainder])
+		drawn++
 	}
-	return bar.String() + colorReset
+	bar.WriteString(strings.Repeat(" ", barWidth-drawn))
+	bar.WriteString(colorReset)
+	return bar.String()
 }
 
 // runeWidth returns display width for wide characters and emoji.
