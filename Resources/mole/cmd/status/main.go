@@ -3,10 +3,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,14 +15,22 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-const refreshInterval = time.Second
+const (
+	refreshInterval      = time.Second
+	processWatchInterval = refreshInterval
+	slowRefreshInterval  = 30 * time.Second
+)
 
 var (
-	Version   = "dev"
-	BuildTime = ""
-
 	// Command-line flags
-	jsonOutput = flag.Bool("json", false, "output metrics as JSON instead of TUI")
+	jsonOutput       = flag.Bool("json", false, "output metrics as JSON instead of TUI")
+	procCPUThreshold = flag.Float64("proc-cpu-threshold", 100, "alert when a process stays above this CPU percent")
+	procCPUWindow    = flag.Duration("proc-cpu-window", 5*time.Minute, "continuous duration a process must exceed the CPU threshold")
+	procCPUAlerts    = flag.Bool("proc-cpu-alerts", true, "enable persistent high-CPU process alerts")
+
+	// Watch mode: stream NDJSON (one snapshot per line) from a single warm collector.
+	watchMode     = flag.Bool("watch", false, "stream metrics continuously as newline-delimited JSON instead of the one-shot TUI/JSON")
+	watchInterval = flag.String("interval", "", "with --watch, collection interval (e.g. 1s, 2s); defaults to 1s")
 )
 
 func shouldUseJSONOutput(forceJSON bool, stdout *os.File) bool {
@@ -41,69 +50,75 @@ func shouldUseJSONOutput(forceJSON bool, stdout *os.File) bool {
 type tickMsg struct{}
 type animTickMsg struct{}
 
+type collectionMode int
+
+const (
+	collectionFast collectionMode = iota
+	collectionProcess
+	collectionFull
+)
+
 type metricsMsg struct {
 	data MetricsSnapshot
 	err  error
+	mode collectionMode
 }
 
 type model struct {
-	collector   *Collector
-	width       int
-	height      int
-	metrics     MetricsSnapshot
-	errMessage  string
-	ready       bool
-	lastUpdated time.Time
-	collecting  bool
-	animFrame   int
-	catHidden   bool // true = hidden, false = visible
+	collector     *Collector
+	width         int
+	height        int
+	metrics       MetricsSnapshot
+	errMessage    string
+	ready         bool
+	lastUpdated   time.Time
+	lastFullAt    time.Time
+	lastProcessAt time.Time
+	collecting    bool
+	animFrame     int
+	catHidden     bool // true = hidden, false = visible
+	cpuCores      int  // how many CPU cores to list; 0 = all
 }
 
-// getConfigPath returns the path to the status preferences file.
-func getConfigPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+// padViewToHeight ensures the rendered frame always overwrites the full
+// terminal region by padding with empty lines up to the current height.
+func padViewToHeight(view string, height int) string {
+	if height <= 0 {
+		return view
 	}
-	return filepath.Join(home, ".config", "mole", "status_prefs")
-}
 
-// loadCatHidden loads the cat hidden preference from config file.
-func loadCatHidden() bool {
-	path := getConfigPath()
-	if path == "" {
-		return false
+	contentHeight := lipgloss.Height(view)
+	if contentHeight >= height {
+		return view
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(data)) == "cat_hidden=true"
-}
 
-// saveCatHidden saves the cat hidden preference to config file.
-func saveCatHidden(hidden bool) {
-	path := getConfigPath()
-	if path == "" {
-		return
-	}
-	// Ensure directory exists
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return
-	}
-	value := "cat_hidden=false"
-	if hidden {
-		value = "cat_hidden=true"
-	}
-	_ = os.WriteFile(path, []byte(value+"\n"), 0644)
+	return view + strings.Repeat("\n", height-contentHeight)
 }
 
 func newModel() model {
 	return model{
-		collector: NewCollector(),
+		collector: NewCollector(processWatchOptionsFromFlags()),
 		catHidden: loadCatHidden(),
+		cpuCores:  loadCPUCores(),
 	}
+}
+
+func processWatchOptionsFromFlags() ProcessWatchOptions {
+	return ProcessWatchOptions{
+		Enabled:      *procCPUAlerts,
+		CPUThreshold: *procCPUThreshold,
+		Window:       *procCPUWindow,
+	}
+}
+
+func validateFlags() error {
+	if *procCPUThreshold < 0 {
+		return fmt.Errorf("--proc-cpu-threshold must be >= 0")
+	}
+	if *procCPUWindow <= 0 {
+		return fmt.Errorf("--proc-cpu-window must be > 0")
+	}
+	return nil
 }
 
 func (m model) Init() tea.Cmd {
@@ -121,6 +136,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.catHidden = !m.catHidden
 			saveCatHidden(m.catHidden)
 			return m, nil
+		case "c":
+			// Cycle how many CPU cores the card lists (2 → 4 → 8 → all) and persist.
+			m.cpuCores = nextCPUCores(m.cpuCores)
+			saveCPUCores(m.cpuCores)
+			return m, nil
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -131,8 +151,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.collecting = true
-		return m, m.collectCmd()
+		return m, m.collectCmd(m.nextCollectionMode(time.Now()))
 	case metricsMsg:
+		wasReady := m.ready
 		if msg.err != nil {
 			m.errMessage = msg.err.Error()
 		} else {
@@ -140,12 +161,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.metrics = msg.data
 		m.lastUpdated = msg.data.CollectedAt
+		if msg.err == nil {
+			recordCollectionFreshness(msg.mode, msg.data.CollectedAt, &m.lastFullAt, &m.lastProcessAt)
+		}
 		m.collecting = false
 		// Mark ready after first successful data collection.
 		if !m.ready {
 			m.ready = true
 		}
-		return m, tickAfter(refreshInterval)
+		delay := refreshInterval
+		if !wasReady {
+			delay = 0
+		}
+		return m, tickAfter(delay)
 	case animTickMsg:
 		m.animFrame++
 		return m, animTickWithSpeed(m.metrics.CPU.Usage)
@@ -164,48 +192,102 @@ func (m model) View() string {
 	}
 
 	header, mole := renderHeader(m.metrics, m.errMessage, m.animFrame, termWidth, m.catHidden)
+	alertBar := renderProcessAlertBar(
+		m.metrics.ProcessAlerts,
+		m.metrics.ProcessStale,
+		m.metrics.ProcessCollectedAt,
+		termWidth,
+	)
 
-	if termWidth <= 80 {
-		cardWidth := termWidth
-		if cardWidth > 2 {
-			cardWidth -= 2
-		}
-		cards := buildCards(m.metrics, cardWidth)
-
-		var rendered []string
-		for i, c := range cards {
-			if i > 0 {
-				rendered = append(rendered, "")
+	renderFrame := func(cpuCores int) string {
+		var cardContent string
+		if termWidth <= 80 {
+			cardWidth := termWidth
+			if cardWidth > 2 {
+				cardWidth -= 2
 			}
-			rendered = append(rendered, renderCard(c, cardWidth, 0))
+			cards := buildCards(m.metrics, cardWidth, cpuCores, !m.lastFullAt.IsZero())
+
+			var rendered []string
+			for i, c := range cards {
+				if i > 0 {
+					rendered = append(rendered, "")
+				}
+				rendered = append(rendered, renderCard(c, cardWidth))
+			}
+			cardContent = lipgloss.JoinVertical(lipgloss.Left, rendered...)
+		} else {
+			cardWidth := max(24, termWidth/2-4)
+			cards := buildCards(m.metrics, cardWidth, cpuCores, !m.lastFullAt.IsZero())
+			cardContent = renderTwoColumns(cards, termWidth)
 		}
+
 		// Combine header, mole, and cards with consistent spacing
-		var content []string
-		content = append(content, header)
-		if mole != "" {
-			content = append(content, mole)
+		parts := []string{header}
+		if alertBar != "" {
+			parts = append(parts, alertBar)
 		}
-		content = append(content, lipgloss.JoinVertical(lipgloss.Left, rendered...))
-		return lipgloss.JoinVertical(lipgloss.Left, content...)
+		if mole != "" {
+			parts = append(parts, mole)
+		}
+		parts = append(parts, cardContent)
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
 	}
 
-	cardWidth := max(24, termWidth/2-4)
-	cards := buildCards(m.metrics, cardWidth)
-	twoCol := renderTwoColumns(cards, termWidth)
-	// Combine header, mole, and cards with consistent spacing
-	var content []string
-	content = append(content, header)
-	if mole != "" {
-		content = append(content, mole)
+	// Every extra core is another card row, and the frame has no scrollback: on
+	// a 20-core Mac "all" adds ~18 lines and pushes the lower cards off a short
+	// window. Step the preference back down until the frame fits; the stored
+	// preference is untouched, so a taller window gets it back.
+	cpuCores := m.cpuCores
+	output := renderFrame(cpuCores)
+	for m.height > 0 && lipgloss.Height(output) > m.height && cpuCores != cpuCoresCycle[0] {
+		cpuCores = smallerCPUCores(cpuCores)
+		output = renderFrame(cpuCores)
 	}
-	content = append(content, twoCol)
-	return lipgloss.JoinVertical(lipgloss.Left, content...)
+	return padViewToHeight(output, m.height)
 }
 
-func (m model) collectCmd() tea.Cmd {
+func (m model) nextCollectionMode(now time.Time) collectionMode {
+	return nextCollectionMode(m.ready, m.lastFullAt, m.lastProcessAt, now)
+}
+
+func nextCollectionMode(ready bool, lastFullAt, lastProcessAt, now time.Time) collectionMode {
+	if !ready {
+		return collectionFast
+	}
+	if lastFullAt.IsZero() || now.Sub(lastFullAt) >= slowRefreshInterval {
+		return collectionFull
+	}
+	if lastProcessAt.IsZero() || now.Sub(lastProcessAt) >= processWatchInterval {
+		return collectionProcess
+	}
+	return collectionFast
+}
+
+func recordCollectionFreshness(mode collectionMode, collectedAt time.Time, lastFullAt, lastProcessAt *time.Time) {
+	if mode == collectionFull {
+		*lastFullAt = collectedAt
+	}
+	if mode == collectionProcess || mode == collectionFull {
+		*lastProcessAt = collectedAt
+	}
+}
+
+func (m model) collectCmd(mode collectionMode) tea.Cmd {
 	return func() tea.Msg {
-		data, err := m.collector.Collect()
-		return metricsMsg{data: data, err: err}
+		var (
+			data MetricsSnapshot
+			err  error
+		)
+		switch mode {
+		case collectionFull:
+			data, err = m.collector.Collect()
+		case collectionProcess:
+			data, err = m.collector.CollectProcesses()
+		default:
+			data, err = m.collector.CollectFast()
+		}
+		return metricsMsg{data: data, err: err, mode: mode}
 	}
 }
 
@@ -225,15 +307,8 @@ func animTickWithSpeed(cpuUsage float64) tea.Cmd {
 
 // runJSONMode collects metrics once and outputs as JSON.
 func runJSONMode() {
-	collector := NewCollector()
+	collector := NewCollector(processWatchOptionsFromFlags())
 
-	// First collection initializes network state (returns nil for network)
-	_, _ = collector.Collect()
-
-	// Wait 1 second for network rate calculation
-	time.Sleep(1 * time.Second)
-
-	// Second collection has actual network data
 	data, err := collector.Collect()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error collecting metrics: %v\n", err)
@@ -257,12 +332,103 @@ func runTUIMode() {
 	}
 }
 
+func parseWatchInterval(raw string) (time.Duration, error) {
+	if raw == "" {
+		return refreshInterval, nil
+	}
+
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --interval %q (want e.g. 1s, 2s): %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid --interval %q (must be > 0)", raw)
+	}
+	return d, nil
+}
+
+// usageText is the help every other Mole subcommand prints by hand. The Go flag
+// package would otherwise render "Usage of /usr/local/bin/status-go:", naming a
+// bundled binary the user never typed, so the text is written out here instead.
+const usageText = `Usage: mo status [OPTIONS]
+
+Monitor system health. Without options it opens the interactive dashboard, and
+switches to a single JSON snapshot when stdout is not a terminal.
+
+Options:
+  --json                          Output one metrics snapshot as JSON
+  --watch                         Stream snapshots as newline-delimited JSON
+  --interval DURATION             With --watch, collection interval (default 1s)
+  --proc-cpu-alerts               Enable high-CPU process alerts (default true)
+  --proc-cpu-threshold PERCENT    Alert above this CPU percent (default 100)
+  --proc-cpu-window DURATION      Time above the threshold before alerting (default 5m)
+  -h, --help                      Show this help message
+
+Examples:
+  mo status                       Interactive dashboard
+  mo status --json                One machine-readable snapshot
+  mo status --watch --interval 2s Continuous NDJSON stream
+`
+
+// parseArgs applies Mole's CLI conventions to the flag package: help goes to
+// stdout and exits 0, and a bad invocation goes to stderr and exits 1 the way
+// every bash subcommand does, rather than the flag package's stderr-and-2.
+// It returns the exit code and whether main should keep running.
+func parseArgs(args []string, stdout, stderr io.Writer) (int, bool) {
+	flag.CommandLine.Init("mo status", flag.ContinueOnError)
+	// Parse must not print: this function decides which stream each message
+	// belongs on, and the default handler writes usage to stderr for both.
+	flag.CommandLine.SetOutput(io.Discard)
+	flag.CommandLine.Usage = func() {}
+
+	err := flag.CommandLine.Parse(args)
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		_, _ = fmt.Fprint(stdout, usageText)
+		return 0, false
+	case err != nil:
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, "Use 'mo status --help' for usage information")
+		return 1, false
+	}
+
+	if err := validateFlags(); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		_, _ = fmt.Fprintln(stderr, "Use 'mo status --help' for usage information")
+		return 1, false
+	}
+	return 0, true
+}
+
 func main() {
-	flag.Parse()
+	if code, keepGoing := parseArgs(os.Args[1:], os.Stdout, os.Stderr); !keepGoing {
+		os.Exit(code)
+	}
+
+	if *watchMode {
+		interval, err := parseWatchInterval(*watchInterval)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			fmt.Fprintln(os.Stderr, "Use 'mo status --help' for usage information")
+			os.Exit(1)
+		}
+		runWatchMode(interval)
+		return
+	}
 
 	if shouldUseJSONOutput(*jsonOutput, os.Stdout) {
 		runJSONMode()
 	} else {
 		runTUIMode()
 	}
+}
+
+func activeAlerts(alerts []ProcessAlert) []ProcessAlert {
+	var active []ProcessAlert
+	for _, alert := range alerts {
+		if alert.Status == "active" {
+			active = append(active, alert)
+		}
+	}
+	return active
 }

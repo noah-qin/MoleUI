@@ -18,6 +18,11 @@ linters:
     - unused
     # Additional linters
     - modernize
+    - revive
+    - unparam
+    # Security scanner. mole deletes files and shells out, so gosec is
+    # high-value here even with some false positives.
+    - gosec
 
   settings:
     govet:
@@ -30,8 +35,26 @@ linters:
         - (io.Closer).Close
         - (*os/exec.Cmd).Run
         - (*os/exec.Cmd).Start
+    revive:
+      rules:
+        - name: use-waitgroup-go
     staticcheck:
       checks: ["all", "-QF1003", "-SA9003"]
+    gosec:
+      # mole is a system tool: scanning user-supplied paths and shelling out
+      # to mdls/du/osascript are core features, not vulnerabilities. We rely
+      # on validatePath (covered by FuzzValidatePath) for path safety and
+      # on osascript escaping in delete.go for command construction.
+      excludes:
+        - G104 # already covered by errcheck
+        - G115 # integer overflow on stat.{Bavail,Bsize,Dev,Ino} and FileInfo.Size; macOS-safe
+        - G204 # subprocess with variable; required for du/mdls/osascript/mdfind
+        - G301 # mkdir perms; we use 0o755 intentionally
+        - G302 # chmod perms; same
+        - G304 # file inclusion via variable; we scan user paths by design
+        - G306 # WriteFile perms; we use 0o644 intentionally
+        - G702 # command injection taint; mdfind/du take user paths by design
+        - G703 # path traversal taint; scanning user paths is mole's purpose
 
   exclusions:
     rules:
@@ -39,6 +62,8 @@ linters:
       - path: _test\.go
         linters:
           - errcheck
+          - gosec
+          - unparam
       # Ignore errors from os.Remove in cleanup code
       - text: "os.Remove"
         linters:

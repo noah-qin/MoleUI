@@ -1,23 +1,34 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_home app-caches
 
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-app-caches.XXXXXX")"
-    export HOME
+    # Prevent AppleScript permission dialogs during tests
+    MOLE_TEST_MODE=1
+    export MOLE_TEST_MODE
 
     mkdir -p "$HOME"
 }
 
 teardown_file() {
-    rm -rf "$HOME"
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
+}
+
+make_fusion_version_dir() {
+    local version_dir="$1"
+    local version="$2"
+    local bundle_id="${3:-com.autodesk.fusion360}"
+    local app_name="${4:-Autodesk Fusion.app}"
+    local info_plist="$version_dir/$app_name/Contents/Info.plist"
+    mkdir -p "$(dirname "$info_plist")" "$version_dir/$app_name/Contents/MacOS"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $bundle_id" \
+        -c "Add :CFBundleVersion string $version" \
+        -c "Add :CFBundleExecutable string Autodesk Fusion" \
+        "$info_plist" > /dev/null
+    touch "$version_dir/$app_name/Contents/MacOS/Autodesk Fusion"
+    chmod +x "$version_dir/$app_name/Contents/MacOS/Autodesk Fusion"
 }
 
 @test "clean_xcode_tools skips derived data when Xcode running" {
@@ -25,19 +36,30 @@ teardown_file() {
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
-pgrep() { return 0; }
+    pgrep() { [[ "$1" == "-x" && "$2" == "xcodebuild" ]]; }
 safe_clean() { echo "$2"; }
 clean_xcode_tools
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Xcode is running"* ]]
-    [[ "$output" != *"derived data"* ]]
-    [[ "$output" != *"archives"* ]]
+    [[ "$output" != *"Xcode DerivedData · skipped"* ]] || return 1
+    [[ "$output" != *"derived data"* ]] || return 1
     [[ "$output" != *"documentation cache"* ]]
 }
 
-@test "clean_xcode_tools cleans documentation caches when Xcode is not running" {
+@test "clean_xcode_tools preserves device logs and user documentation stores" {
+    local ios_log="$HOME/Library/Developer/Xcode/iOS Device Logs/sentinel.log"
+    local watch_log="$HOME/Library/Developer/Xcode/watchOS Device Logs/sentinel.log"
+    local doc_cache="$HOME/Library/Developer/Xcode/DocumentationCache/sentinel.doc"
+    local doc_index="$HOME/Library/Developer/Xcode/DocumentationIndex/sentinel.index"
+    mkdir -p "$(dirname "$ios_log")" "$(dirname "$watch_log")" \
+        "$(dirname "$doc_cache")" "$(dirname "$doc_index")"
+    touch "$ios_log" "$watch_log" "$doc_cache" "$doc_index"
+    mkdir -p "$HOME/Library/Caches/com.apple.dt.Xcode"
+    mkdir -p "$HOME/Library/Developer/Xcode/Products"
+    touch "$HOME/Library/Caches/com.apple.dt.Xcode/candidate"
+    touch "$HOME/Library/Developer/Xcode/Products/candidate"
+
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -48,26 +70,307 @@ clean_xcode_tools
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Xcode derived data"* ]]
-    [[ "$output" == *"Xcode archives"* ]]
-    [[ "$output" == *"Xcode documentation cache"* ]]
-    [[ "$output" == *"Xcode documentation index"* ]]
+    # Xcode cache and build products are positive controls proving the cleanup
+    # body ran; diagnostics and downloaded documentation must stay review-only.
+    [[ "$output" == *"Xcode cache"* ]] || return 1
+    [[ "$output" == *"Xcode build products"* ]] || return 1
+    [[ "$output" != *"iOS device logs"* ]] || return 1
+    [[ "$output" != *"watchOS device logs"* ]] || return 1
+    [[ "$output" != *"Xcode documentation cache"* ]] || return 1
+    [[ "$output" != *"Xcode documentation index"* ]] || return 1
+    [[ "$output" != *"Xcode archives"* ]] || return 1
+    [[ -f "$ios_log" && -f "$watch_log" && -f "$doc_cache" && -f "$doc_index" ]]
 }
 
-@test "clean_media_players protects spotify offline cache" {
+@test "clean_xcode_tools skips Xcode paths while xcodebuild is active" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { [[ "$2" == "xcodebuild" ]]; }
+safe_clean() {
+    case "${!#}" in
+        "Xcode cache" | "Xcode build products") echo "UNEXPECTED_XCODE_CLEAN:${!#}" ;;
+    esac
+}
+clean_xcode_tools
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"Xcode cache/build products · skipped"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_XCODE_CLEAN"* ]]
+}
+
+@test "clean_xcode_tools fails closed when process state is unknown" {
+    mkdir -p "$HOME/Library/Caches/com.apple.dt.Xcode"
+    touch "$HOME/Library/Caches/com.apple.dt.Xcode/candidate"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 2; }
+safe_clean() { echo "UNEXPECTED_CLEAN:${!#}"; }
+clean_xcode_tools
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"process state unknown"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN"* ]]
+}
+
+@test "clean_3d_tools defers Autodesk cache while Fusion helper is active (#1390)" {
+    mkdir -p "$HOME/Library/Caches/com.autodesk.AcCoreConsole"
+    touch "$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 0; }
+safe_clean() {
+    case "${!#}" in
+        "Autodesk cache") echo "UNEXPECTED_CLEAN:${!#}" ;;
+    esac
+}
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+note_activity() { :; }
+clean_3d_tools
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"DEFER:Autodesk"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN"* ]]
+}
+
+@test "clean_3d_tools cleans Autodesk cache when Fusion is not running (#1390)" {
+    mkdir -p "$HOME/Library/Caches/com.autodesk.AcCoreConsole"
+    touch "$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+safe_clean() { echo "CLEAN:${!#}"; }
+clean_3d_tools
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"CLEAN:Autodesk cache"* ]] || return 1
+}
+
+@test "clean_xcode_tools does not defer empty Xcode and Simulator roots" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+rm -rf "$HOME/Library/Caches/com.apple.dt.Xcode" \
+    "$HOME/Library/Developer/Xcode/Products" \
+    "$HOME/Library/Developer/Xcode/DerivedData" \
+    "$HOME/Library/Developer/CoreSimulator/Caches" \
+    "$HOME/Library/Developer/CoreSimulator/Devices" \
+    "$HOME/Library/Logs/CoreSimulator"
+mkdir -p "$HOME/Library/Caches/com.apple.dt.Xcode" \
+    "$HOME/Library/Developer/Xcode/Products" \
+    "$HOME/Library/Developer/Xcode/DerivedData" \
+    "$HOME/Library/Developer/CoreSimulator/Caches" \
+    "$HOME/Library/Developer/CoreSimulator/Devices" \
+    "$HOME/Library/Logs/CoreSimulator"
+pgrep() { return 0; }
+defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+safe_clean() { echo "UNEXPECTED_CLEAN:${!#}"; }
+clean_xcode_tools
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN"* ]] || return 1
+    [[ "$output" != *"process state unknown"* ]]
+}
+
+@test "clean_xcode_tools does not defer broken-symlink-only Xcode roots" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+rm -rf "$HOME/Library/Caches/com.apple.dt.Xcode" \
+    "$HOME/Library/Developer/Xcode/Products" \
+    "$HOME/Library/Developer/Xcode/DerivedData"
+mkdir -p "$HOME/Library/Caches/com.apple.dt.Xcode"
+ln -s "$HOME/missing-xcode-cache" "$HOME/Library/Caches/com.apple.dt.Xcode/broken"
+mkdir -p "$HOME/Library/Caches/com.apple.dt.Xcode/compiled/com.apple.e5rt.e5bundlecache"
+pgrep() { return 0; }
+defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+safe_clean() { echo "UNEXPECTED_CLEAN:${!#}"; }
+clean_xcode_tools
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN"* ]]
+}
+
+@test "clean_xcode_tools does not defer after a cache-only pass completes" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+rm -rf "$HOME/Library/Caches/com.apple.dt.Xcode" \
+    "$HOME/Library/Developer/Xcode/Products" \
+    "$HOME/Library/Developer/Xcode/DerivedData"
+mkdir -p "$HOME/Library/Caches/com.apple.dt.Xcode"
+touch "$HOME/Library/Caches/com.apple.dt.Xcode/candidate"
+
+probe_round=0
+_xcode_cleanup_process_state() {
+    probe_round=$((probe_round + 1))
+    [[ $probe_round -gt 2 ]] && return 0
+    return 1
+}
+_app_cache_safe_clean_guarded() {
+    local state=0
+    _xcode_cleanup_process_state || state=$?
+    [[ $state -eq 1 ]] || return 75
+    command rm -f "$HOME/Library/Caches/com.apple.dt.Xcode/candidate"
+    echo "CLEANED:Xcode cache"
+}
+defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+clean_xcode_tools
+[[ ! -e "$HOME/Library/Caches/com.apple.dt.Xcode/candidate" ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"CLEANED:Xcode cache"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]]
+}
+
+@test "clean_xcode_tools ignores active whitelist-only candidates" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+rm -rf "$HOME/Library/Caches/com.apple.dt.Xcode" \
+    "$HOME/Library/Developer/Xcode/Products" \
+    "$HOME/Library/Developer/Xcode/DerivedData"
+mkdir -p "$HOME/Library/Caches/com.apple.dt.Xcode"
+target="$HOME/Library/Caches/com.apple.dt.Xcode/whitelisted"
+touch "$target"
+is_path_whitelisted() { [[ "$1" == "$target" ]]; }
+pgrep() { return 0; }
+defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+safe_clean() { echo "UNEXPECTED_CLEAN:${!#}"; }
+clean_xcode_tools
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN"* ]]
+}
+
+@test "clean_xcode_tools does not duplicate unavailable simulator cleanup" {
+    run grep -n "simctl" "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+}
+
+@test "standalone guarded app-cache cleanup rechecks before falling back to safe_clean" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+unset -f safe_clean_guarded 2> /dev/null || true
+deny_delete() { return 1; }
+safe_clean() { echo "UNEXPECTED_SAFE_CLEAN"; }
+note_activity() { :; }
+
+rc=0
+_app_cache_safe_clean_guarded deny_delete "Guarded cache" "$HOME/cache" "Guarded cache" || rc=$?
+[[ $rc -ne 0 ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"UNEXPECTED_SAFE_CLEAN"* ]] || return 1
+}
+
+@test "standalone simulator probe ignores idle launchd services" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() {
+    [[ "$1" == "-x" && ("$2" == "CoreSimulatorService" || "$2" == "simdiskimaged") ]]
+}
+
+probe_status=0
+_simulator_cleanup_process_state || probe_status=$?
+[[ $probe_status -eq 1 ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "clean_media_players protects spotify offline cache when bnk has content" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 mkdir -p "$HOME/Library/Application Support/Spotify/PersistentCache/Storage"
-touch "$HOME/Library/Application Support/Spotify/PersistentCache/Storage/offline.bnk"
+dd if=/dev/zero of="$HOME/Library/Application Support/Spotify/PersistentCache/Storage/offline.bnk" bs=1024 count=2 2>/dev/null
 safe_clean() { echo "CLEAN:$2"; }
 clean_media_players
 EOF
 
     [ "$status" -eq 0 ]
+    [[ "$output" != *"CLEAN:Spotify cache"* ]] || return 1
     [[ "$output" == *"Spotify cache protected"* ]]
-    [[ "$output" != *"CLEAN: Spotify cache"* ]]
+}
+
+@test "clean_media_players cleans spotify cache when bnk is empty" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+mkdir -p "$HOME/Library/Application Support/Spotify/PersistentCache/Storage"
+> "$HOME/Library/Application Support/Spotify/PersistentCache/Storage/offline.bnk"
+safe_clean() { echo "CLEAN:$2"; }
+clean_media_players
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Spotify cache protected"* ]] || return 1
+    [[ "$output" == *"CLEAN:Spotify cache"* ]]
 }
 
 @test "clean_user_gui_applications calls all sections" {
@@ -80,30 +383,444 @@ safe_clean() { :; }
 clean_xcode_tools() { echo "xcode"; }
 clean_code_editors() { echo "editors"; }
 clean_communication_apps() { echo "comm"; }
+clean_dingtalk() { echo "dingtalk"; }
+clean_ai_apps() { echo "ai"; }
 clean_user_gui_applications
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"xcode"* ]]
-    [[ "$output" == *"editors"* ]]
-    [[ "$output" == *"comm"* ]]
+    [[ "$output" != *"xcode"* ]] || return 1
+    [[ "$output" != *"editors"* ]] || return 1
+    [[ "$output" == *"comm"* ]] || return 1
+    [[ "$output" == *"dingtalk"* ]] || return 1
+    [[ "$output" == *"ai"* ]]
+}
+
+@test "clean_final_cut_pro_generated_caches targets only safe generated media in Movies libraries" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+mkdir -p "$HOME/Movies/Project.fcpbundle/Event/Render Files/High Quality Media"
+mkdir -p "$HOME/Movies/Project.fcpbundle/Event/Transcoded Media/Proxy Media"
+mkdir -p "$HOME/Movies/Project.fcpbundle/Event/Transcoded Media/High Quality Media"
+mkdir -p "$HOME/Movies/Project.fcpbundle/Event/Analysis Files/Stabilization"
+mkdir -p "$HOME/Movies/Project.fcpbundle/Event/Original Media/Render Files/High Quality Media"
+mkdir -p "$HOME/Documents/Other.fcpbundle/Event/Render Files/High Quality Media"
+
+touch "$HOME/Movies/Project.fcpbundle/Event/Render Files/High Quality Media/render.mov"
+touch "$HOME/Movies/Project.fcpbundle/Event/Transcoded Media/Proxy Media/proxy.mov"
+
+pgrep() { return 1; }
+safe_clean() {
+    local arg
+    for arg in "$@"; do
+        printf 'CLEAN:%s\n' "$arg"
+    done
+}
+
+clean_final_cut_pro_generated_caches
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$HOME/Movies/Project.fcpbundle/Event/Render Files/High Quality Media"* ]] || return 1
+    [[ "$output" == *"CLEAN:$HOME/Movies/Project.fcpbundle/Event/Transcoded Media/Proxy Media"* ]] || return 1
+    [[ "$output" == *"CLEAN:Final Cut Pro generated cache"* ]] || return 1
+    [[ "$output" != *"Transcoded Media/High Quality Media"* ]] || return 1
+    [[ "$output" != *"Analysis Files"* ]] || return 1
+    [[ "$output" != *"Original Media"* ]] || return 1
+    [[ "$output" != *"Documents/Other.fcpbundle"* ]]
+}
+
+@test "clean_final_cut_pro_generated_caches skips while Final Cut Pro is running" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+mkdir -p "$HOME/Movies/Project.fcpbundle/Event/Render Files/High Quality Media"
+pgrep() { return 0; }
+safe_clean() {
+    echo "unexpected safe_clean"
+    return 1
+}
+
+clean_final_cut_pro_generated_caches
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Final Cut Pro generated caches · skipped"* ]] || return 1
+    [[ "$output" != *"unexpected safe_clean"* ]]
+}
+
+@test "clean_final_cut_pro_generated_caches does not defer whitelist-only targets" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+target="$HOME/Movies/Whitelisted.fcpbundle/Event/Render Files/High Quality Media"
+mkdir -p "$target"
+touch "$target/render.mov"
+should_protect_path() { return 1; }
+is_path_whitelisted() { [[ "$1" == "$target" ]]; }
+pgrep() { return 0; }
+defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+safe_clean() { echo "UNEXPECTED_CLEAN:${!#}"; }
+clean_final_cut_pro_generated_caches
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN"* ]]
+}
+
+@test "clean_final_cut_pro_generated_caches rechecks activity after sizing" {
+    run env HOME="$HOME/fcp-size-race" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+target="$HOME/Movies/Race.fcpbundle/Event/Render Files/High Quality Media"
+mkdir -p "$target"
+touch "$target/render.mov"
+pgrep() {
+    [[ -e "$HOME/fcp-started" ]] && return 0
+    return 1
+}
+get_cleanup_path_size_kb() {
+    : > "$HOME/fcp-started"
+    echo 1
+}
+safe_remove() { echo "UNEXPECTED_DELETE:$1"; return 0; }
+rm -f "$HOME/fcp-started"
+clean_final_cut_pro_generated_caches
+[[ -f "$target/render.mov" ]] || exit 1
+printf 'DEFER:%s\n' "$(format_deferred_cleanup_families)"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"UNEXPECTED_DELETE"* ]] || return 1
+    [[ "$output" == *"DEFER:Final Cut Pro"* ]]
+}
+
+@test "clean_final_cut_pro_generated_caches fails closed when its process probe errors" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+target="$HOME/Movies/Project.fcpbundle/Event/Render Files/High Quality Media"
+mkdir -p "$target"
+touch "$target/sentinel"
+pgrep() { return 2; }
+safe_clean() { echo "UNEXPECTED_SAFE_CLEAN:${!#}"; }
+note_activity() { :; }
+
+clean_final_cut_pro_generated_caches
+[[ -f "$target/sentinel" ]] || exit 1
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Final Cut Pro generated caches · skipped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_SAFE_CLEAN"* ]]
+}
+
+@test "whitelist row keeps FCP proxy media while render files are cleaned (#1499)" {
+    run env HOME="$HOME/fcp-1499" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/manage/whitelist.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+# Flat and nested libraries: the nested one pins the segment-spanning glob.
+flat_proxy="$HOME/Movies/Project.fcpbundle/Event/Transcoded Media/Proxy Media"
+flat_render="$HOME/Movies/Project.fcpbundle/Event/Render Files/High Quality Media"
+nested_proxy="$HOME/Movies/Sub/Nested.fcpbundle/Event/Transcoded Media/Proxy Media"
+nested_render="$HOME/Movies/Sub/Nested.fcpbundle/Event/Render Files/High Quality Media"
+mkdir -p "$flat_proxy" "$flat_render" "$nested_proxy" "$nested_render"
+touch "$flat_proxy/proxy.mov" "$flat_render/render.mov"
+touch "$nested_proxy/proxy.mov" "$nested_render/render.mov"
+
+# Use the shipped catalog pattern, not a hand-written copy, so this test goes
+# red when the row is absent (pre-fix) or its pattern drifts.
+fcp_pattern=""
+while IFS='|' read -r name pattern _; do
+    if [[ "$name" == "Final Cut Pro proxy media"* ]]; then
+        fcp_pattern="${pattern/\$HOME/$HOME}"
+    fi
+done < <(get_all_cache_items)
+[[ -n "$fcp_pattern" ]] || exit 1
+
+WHITELIST_PATTERNS=("$fcp_pattern")
+pgrep() { return 1; }
+defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+safe_clean() {
+    local arg
+    for arg in "$@"; do
+        printf 'CLEAN:%s\n' "$arg"
+    done
+}
+
+clean_final_cut_pro_generated_caches
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"CLEAN:$HOME/fcp-1499/Movies/Project.fcpbundle/Event/Render Files/High Quality Media"* ]] || return 1
+    [[ "$output" == *"CLEAN:$HOME/fcp-1499/Movies/Sub/Nested.fcpbundle/Event/Render Files/High Quality Media"* ]] || return 1
+    [[ "$output" != *"Transcoded Media/Proxy Media"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]]
+}
+
+@test "clean_jianying_pro_generated_caches targets only whitelisted regenerable subdirs" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+cache_root="$HOME/Movies/JianyingPro/User Data/Cache"
+# Regenerable (should be cleaned)
+mkdir -p "$cache_root/recognize"
+mkdir -p "$cache_root/frameThumbnail"
+mkdir -p "$cache_root/audioWave"
+mkdir -p "$cache_root/AlgorithmCache"
+# Draft-referenced / downloaded assets (must be preserved)
+mkdir -p "$cache_root/effect"
+mkdir -p "$cache_root/music"
+mkdir -p "$cache_root/AigcMaterailCache"
+mkdir -p "$cache_root/agencycache"
+# Copies of user-imported material (must be preserved, see the exclusion note)
+mkdir -p "$cache_root/image"
+mkdir -p "$cache_root/importcache3"
+# The user's editable drafts (must never be touched)
+mkdir -p "$HOME/Movies/JianyingPro/User Data/Projects/com.lveditor.draft/my-project"
+
+pgrep() { return 1; }
+safe_clean() {
+    local arg
+    for arg in "$@"; do
+        printf 'CLEAN:%s\n' "$arg"
+    done
+}
+
+clean_jianying_pro_generated_caches
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$HOME/Movies/JianyingPro/User Data/Cache/recognize"* ]] || return 1
+    [[ "$output" == *"CLEAN:$HOME/Movies/JianyingPro/User Data/Cache/frameThumbnail"* ]] || return 1
+    [[ "$output" == *"CLEAN:$HOME/Movies/JianyingPro/User Data/Cache/audioWave"* ]] || return 1
+    [[ "$output" == *"CLEAN:$HOME/Movies/JianyingPro/User Data/Cache/AlgorithmCache"* ]] || return 1
+    [[ "$output" == *"CLEAN:JianyingPro generated cache"* ]] || return 1
+    [[ "$output" != *"Cache/effect"* ]] || return 1
+    [[ "$output" != *"Cache/music"* ]] || return 1
+    [[ "$output" != *"Cache/image"* ]] || return 1
+    [[ "$output" != *"importcache3"* ]] || return 1
+    [[ "$output" != *"AigcMaterailCache"* ]] || return 1
+    [[ "$output" != *"agencycache"* ]] || return 1
+    [[ "$output" != *"Projects"* ]] || return 1
+}
+
+@test "jianying_pro_is_running ignores the resident menu-bar tray helper" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+# Faithful pgrep mock for a process table that contains ONLY the always-on
+# tray helper: -x compares the pattern against the process name exactly,
+# and -f substring-matches the pattern against the command line, like real
+# pgrep does.
+helper_name="VideoFusion-macOSTrayHelper"
+helper_cmdline="/Applications/VideoFusion-macOS.app/Contents/Frameworks/VideoFusion-macOSTrayHelper.app/Contents/MacOS/VideoFusion-macOSTrayHelper"
+pgrep() {
+    local mode="$1"
+    local pattern="${!#}"
+    if [[ "$mode" == "-x" ]]; then
+        [[ "$helper_name" == "$pattern" ]] && return 0
+        return 1
+    fi
+    case "$helper_cmdline" in
+        *"$pattern"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Mock fidelity check: the historical broad probe DOES match the helper's
+# command line. Without this, a lazy mock would pass even if the production
+# probe were widened back to "/VideoFusion-macOS.app/".
+if pgrep -f "/VideoFusion-macOS.app/" > /dev/null 2>&1; then
+    echo "MOCK-FAITHFUL: broad pattern matches helper"
+fi
+
+if jianying_pro_is_running; then
+    echo "WRONG: reported running"
+else
+    echo "OK: not running"
+fi
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"MOCK-FAITHFUL: broad pattern matches helper"* ]] || return 1
+    [[ "$output" == *"OK: not running"* ]] || return 1
+    [[ "$output" != *"WRONG"* ]] || return 1
+}
+
+@test "clean_jianying_pro_generated_caches skips while JianyingPro is running" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+mkdir -p "$HOME/Movies/JianyingPro/User Data/Cache/recognize"
+pgrep() { return 0; }
+safe_clean() {
+    echo "unexpected safe_clean"
+    return 1
+}
+
+clean_jianying_pro_generated_caches
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"JianyingPro generated caches · skipped (JianyingPro running)"* ]] || return 1
+    [[ "$output" != *"unexpected safe_clean"* ]] || return 1
+}
+
+@test "clean_jianying_pro_generated_caches fails closed when the process probe errors" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+mkdir -p "$HOME/Movies/JianyingPro/User Data/Cache/recognize"
+pgrep() { return 2; }
+safe_clean() {
+    echo "unexpected safe_clean"
+    return 1
+}
+
+clean_jianying_pro_generated_caches
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"skipped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"unexpected safe_clean"* ]] || return 1
+}
+
+@test "clean_jianying_pro_generated_caches is a no-op when cache root is absent" {
+    local empty_home
+    empty_home="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-app-caches.XXXXXX")"
+    run env HOME="$empty_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+pgrep() { return 1; }
+safe_clean() {
+    echo "unexpected safe_clean"
+    return 1
+}
+
+clean_jianying_pro_generated_caches
+EOF
+    rm -rf "$empty_home"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"unexpected safe_clean"* ]] || return 1
+}
+
+@test "is_final_cut_pro_generated_cache_target rejects protected sibling paths" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+
+library="$HOME/Movies/Project.fcpbundle"
+mkdir -p "$library/Event/Render Files/High Quality Media"
+mkdir -p "$library/Event/Original Media/Render Files/High Quality Media"
+mkdir -p "$library/Event/Transcoded Media/High Quality Media"
+
+is_final_cut_pro_generated_cache_target "$library" "$library/Event/Render Files/High Quality Media"
+! is_final_cut_pro_generated_cache_target "$library" "$library/Event/Original Media/Render Files/High Quality Media"
+! is_final_cut_pro_generated_cache_target "$library" "$library/Event/Transcoded Media/High Quality Media"
+EOF
+
+    [ "$status" -eq 0 ]
 }
 
 @test "clean_ai_apps calls expected caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 safe_clean() { echo "$2"; }
+note_activity() { :; }
 clean_ai_apps
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"ChatGPT cache"* ]]
-    [[ "$output" == *"Claude desktop cache"* ]]
+    [[ "$output" == *"ChatGPT cache"* ]] || return 1
+    [[ "$output" == *"Claude desktop cache"* ]] || return 1
+    [[ "$output" != *"Google Clearcut logs"* ]] || return 1
+    [[ "$output" == *"LM Studio cache"* ]] || return 1
+    [[ "$output" != *"Codex"* ]]
+}
+
+@test "clean_ai_apps targets app cache but never the legacy LM Studio home" {
+    mkdir -p "$HOME/Library/Caches/com.lmstudio.lmstudio"
+    echo "cache" > "$HOME/Library/Caches/com.lmstudio.lmstudio/cache.bin"
+    mkdir -p "$HOME/.cache/lm-studio/models"
+    echo "model" > "$HOME/.cache/lm-studio/models/keep.gguf"
+    mkdir -p "$HOME/.lmstudio/models"
+    echo "model" > "$HOME/.lmstudio/models/keep.gguf"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { printf 'CLEAN:%s\n' "${@:1:$#-1}"; }
+note_activity() { :; }
+clean_ai_apps
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$HOME/Library/Caches/com.lmstudio.lmstudio/cache.bin"* ]] || return 1
+    [[ "$output" != *"$HOME/.cache/lm-studio"* ]] || return 1
+    [[ "$output" != *"$HOME/.lmstudio"* ]] || return 1
+}
+
+@test "clean_ai_apps skips Codex Desktop state by default" {
+    mkdir -p "$HOME/Library/Application Support/Codex/Cache" "$HOME/Library/Logs/com.openai.codex"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+note_activity() { echo "NOTE_ACTIVITY"; }
+clean_ai_apps
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Codex Desktop state"* ]] || return 1
+    [[ "$output" != *"NOTE_ACTIVITY"* ]] || return 1
+    [[ "$output" != *"Codex cache"* ]] || return 1
+    [[ "$output" != *"Codex CLI logs"* ]]
 }
 
 @test "clean_design_tools calls expected caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 safe_clean() { echo "$2"; }
@@ -111,25 +828,26 @@ clean_design_tools
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Sketch cache"* ]]
+    [[ "$output" == *"Sketch cache"* ]] || return 1
     [[ "$output" == *"Figma cache"* ]]
 }
 
 @test "clean_dingtalk calls expected caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
+mkdir -p ~/Library/Application\ Support/iDingTalk
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 safe_clean() { echo "$2"; }
 clean_dingtalk
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"DingTalk iDingTalk cache"* ]]
+    [[ "$output" == *"DingTalk iDingTalk cache"* ]] || return 1
     [[ "$output" == *"DingTalk logs"* ]]
 }
 
 @test "clean_download_managers calls expected caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 safe_clean() { echo "$2"; }
@@ -137,12 +855,12 @@ clean_download_managers
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Aria2 cache"* ]]
+    [[ "$output" == *"Aria2 cache"* ]] || return 1
     [[ "$output" == *"qBittorrent cache"* ]]
 }
 
 @test "clean_productivity_apps calls expected caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 safe_clean() { echo "$2"; }
@@ -150,12 +868,12 @@ clean_productivity_apps
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"MiaoYan cache"* ]]
+    [[ "$output" == *"MiaoYan cache"* ]] || return 1
     [[ "$output" == *"Flomo cache"* ]]
 }
 
 @test "clean_screenshot_tools calls expected caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 safe_clean() { echo "$2"; }
@@ -163,12 +881,12 @@ clean_screenshot_tools
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"CleanShot cache"* ]]
+    [[ "$output" == *"CleanShot cache"* ]] || return 1
     [[ "$output" == *"Xnip cache"* ]]
 }
 
 @test "clean_office_applications calls expected caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/clean/user.sh"
 stop_section_spinner() { :; }
@@ -177,34 +895,2039 @@ clean_office_applications
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Microsoft Word cache"* ]]
+    [[ "$output" == *"Microsoft Word cache"* ]] || return 1
     [[ "$output" == *"Apple iWork cache"* ]]
 }
 
 @test "clean_communication_apps includes Microsoft Teams legacy caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
+mkdir -p ~/Library/Application\ Support/Microsoft/Teams
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 safe_clean() { echo "$2"; }
 clean_communication_apps
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Microsoft Teams legacy cache"* ]]
+    [[ "$output" == *"Microsoft Teams legacy cache"* ]] || return 1
     [[ "$output" == *"Microsoft Teams legacy logs"* ]]
 }
 
-@test "clean_gaming_platforms includes steam and minecraft related caches" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" bash --noprofile --norc << 'EOF'
+@test "clean_communication_apps cleans Feishu embedded webview Service Worker per profile" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
+feishu_base="$HOME/Library/Application Support/LarkShell/aha/users"
+lark_base="$HOME/Library/Application Support/LarkInternational/aha/users"
+mkdir -p "$feishu_base/57bea93a/profile_explorer/Service Worker/CacheStorage"
+mkdir -p "$feishu_base/6ef03470/profile_explorer/Service Worker/CacheStorage"
+mkdir -p "$lark_base/70ac6ef0/profile_explorer/Service Worker/CacheStorage"
+# A non-profile sibling under users/ must be ignored.
+mkdir -p "$feishu_base/global"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "SC|$2"; }
+feishu_or_lark_running() { return 1; }
+clean_service_worker_cache() { echo "SW|$1|$2|$3|$4"; }
+clean_communication_apps
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SW|Feishu|$HOME/Library/Application Support/LarkShell/aha/users/57bea93a/profile_explorer/Service Worker/CacheStorage|_feishu_service_worker_delete_guard_allows|"* ]] || return 1
+    [[ "$output" == *"SW|Feishu|$HOME/Library/Application Support/LarkShell/aha/users/6ef03470/profile_explorer/Service Worker/CacheStorage|_feishu_service_worker_delete_guard_allows|"* ]] || return 1
+    [[ "$output" == *"SW|Lark|$HOME/Library/Application Support/LarkInternational/aha/users/70ac6ef0/profile_explorer/Service Worker/CacheStorage|_feishu_service_worker_delete_guard_allows|"* ]] || return 1
+    [[ "$output" != *"users/global/"* ]] || return 1
+}
+
+@test "clean_notion_service_worker_caches targets CacheStorage in every Electron partition" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+partitions="$HOME/Library/Application Support/Notion/Partitions"
+mkdir -p "$partitions/notion/Service Worker/CacheStorage"
+mkdir -p "$partitions/notion-second/Service Worker/CacheStorage"
+# A partition with no Service Worker cache, and the siblings that must survive.
+mkdir -p "$partitions/empty-partition"
+mkdir -p "$partitions/notion/Service Worker/ScriptCache"
+mkdir -p "$partitions/notion/Service Worker/Database"
+mkdir -p "$partitions/notion/Local Storage"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 1; }
+clean_service_worker_cache() { echo "SW|$1|$2|$3"; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    local base="$HOME/Library/Application Support/Notion/Partitions"
+    [[ "$output" == *"SW|Notion|$base/notion/Service Worker/CacheStorage|_notion_service_worker_delete_guard_allows"* ]] || return 1
+    [[ "$output" == *"SW|Notion|$base/notion-second/Service Worker/CacheStorage|_notion_service_worker_delete_guard_allows"* ]] || return 1
+    [[ "$output" != *"empty-partition"* ]] || return 1
+    [[ "$output" != *"ScriptCache"* ]] || return 1
+    [[ "$output" != *"Database"* ]] || return 1
+    [[ "$output" != *"Local Storage"* ]]
+}
+
+@test "clean_notion_service_worker_caches defers every partition while Notion is running" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p "$HOME/Library/Application Support/Notion/Partitions/notion/Service Worker/CacheStorage/origin/cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 0; }
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER:Notion"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]]
+}
+
+@test "clean_notion_service_worker_caches fails closed on unknown owner state" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p "$HOME/Library/Application Support/Notion/Partitions/notion/Service Worker/CacheStorage/origin/cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 2; }
+mole_defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+note_activity() { :; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"Notion Service Worker · stopped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]]
+}
+
+@test "clean_notion_service_worker_caches refuses a symlinked partitions root" {
+    local iso="$HOME/iso-notion-root-symlink"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p "$HOME/Library/Application Support/Notion" "$HOME/outside/notion/Service Worker/CacheStorage"
+touch "$HOME/outside/notion/Service Worker/CacheStorage/private"
+ln -s "$HOME/outside" "$HOME/Library/Application Support/Notion/Partitions"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 1; }
+clean_service_worker_cache() { echo "SW|$2"; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"outside"* ]] || return 1
+    [[ "$output" != *"SW|"* ]]
+}
+
+@test "clean_notion_service_worker_caches refuses a symlinked cache child" {
+    local iso="$HOME/iso-notion-child-symlink"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+sw="$HOME/Library/Application Support/Notion/Partitions/notion/Service Worker"
+mkdir -p "$sw" "$HOME/outside"
+touch "$HOME/outside/private"
+ln -s "$HOME/outside" "$sw/CacheStorage"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+notion_running() { return 1; }
+clean_service_worker_cache() { echo "SW|$2"; }
+clean_notion_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"outside"* ]] || return 1
+    [[ "$output" != *"SW|"* ]]
+}
+
+@test "clean_feishu_service_worker_caches preserves pipe characters in profile paths" {
+    local pipe_home="$HOME/home|pipe"
+    run env HOME="$pipe_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+cache="$HOME/Library/Application Support/LarkShell/aha/users/57bea93a/profile_explorer/Service Worker/CacheStorage"
+mkdir -p "$cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+feishu_or_lark_running() { return 1; }
+clean_service_worker_cache() { printf 'SW:%s:%s\n' "$1" "$2"; }
+clean_feishu_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"SW:Feishu:$pipe_home/Library/Application Support/LarkShell/aha/users/57bea93a/profile_explorer/Service Worker/CacheStorage"* ]]
+}
+
+@test "clean_feishu_service_worker_caches skips all profiles while owner is running" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+cache="$HOME/Library/Application Support/LarkShell/aha/users/57bea93a/profile_explorer/Service Worker/CacheStorage"
+mkdir -p "$cache/origin/cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+feishu_or_lark_running() { return 0; }
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+clean_feishu_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER:Feishu/Lark"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]]
+}
+
+@test "clean_feishu_service_worker_caches fails closed on unknown owner state" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+cache="$HOME/Library/Application Support/LarkShell/aha/users/57bea93a/profile_explorer/Service Worker/CacheStorage"
+mkdir -p "$cache/origin/cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+feishu_or_lark_running() { return 2; }
+mole_defer_cleanup_family() { echo "UNEXPECTED_DEFER:$1"; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+note_activity() { :; }
+clean_feishu_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"Feishu/Lark Service Worker · stopped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_DEFER"* ]]
+}
+
+@test "clean_feishu_service_worker_caches rechecks owner after sizing" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+marker="$HOME/feishu-started"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+declare -a PROTECTED_SW_DOMAINS=("never.invalid")
+cache="$HOME/Library/Application Support/LarkShell/aha/users/57bea93a/profile_explorer/Service Worker/CacheStorage"
+candidate="$cache/origin/cache"
+mkdir -p "$candidate"
+feishu_or_lark_running() { [[ -e "$marker" ]] && return 0 || return 1; }
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+note_activity() { :; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == "sh" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    if [[ "$1" == "du" ]]; then
+        touch "$marker"
+        printf '512\t%s\n' "$candidate"
+        return 0
+    fi
+    "$@"
+}
+clean_feishu_service_worker_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER:Feishu/Lark"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]]
+}
+
+@test "clean_feishu_service_worker_caches is a no-op when the aha profile root is absent" {
+    local empty_home
+    empty_home="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-app-caches.XXXXXX")"
+    run env HOME="$empty_home" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+clean_service_worker_cache() { echo "unexpected SW call"; }
+clean_feishu_service_worker_caches
+echo "done-no-op"
+EOF
+    rm -rf "$empty_home"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"unexpected SW call"* ]] || return 1
+    [[ "$output" == *"done-no-op"* ]] || return 1
+}
+
+@test "clean_gaming_platforms includes steam and minecraft related caches" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p ~/Library/Application\ Support/Steam ~/Library/Application\ Support/Battle.net
+mkdir -p ~/Library/Application\ Support/minecraft ~/.lunarclient
+mkdir -p ~/Library/Application\ Support/PCSX2 ~/Library/Application\ Support/rpcs3
 source "$PROJECT_ROOT/lib/clean/app_caches.sh"
 safe_clean() { echo "$2"; }
 clean_gaming_platforms
 EOF
 
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Steam app cache"* ]]
-    [[ "$output" == *"Steam shader cache"* ]]
-    [[ "$output" == *"Minecraft logs"* ]]
+    [[ "$output" == *"Steam app cache"* ]] || return 1
+    [[ "$output" == *"Steam shader cache"* ]] || return 1
+    [[ "$output" == *"Minecraft logs"* ]] || return 1
     [[ "$output" == *"Lunar Client logs"* ]]
+}
+
+@test "clean_code_editors includes Zed caches" {
+    mkdir -p "$HOME/Library/Application Support/Zed/node/cache/_cacache"
+    mkdir -p "$HOME/Library/Application Support/Zed/node/node-v24.11.0-darwin-arm64/cache/_cacache"
+    mkdir -p "$HOME/Library/Application Support/Zed/node/node-v24.11.0-darwin-arm64/bin"
+    mkdir -p "$HOME/Library/Application Support/Zed/db"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "CLEAN:$1|$2"; }
+clean_code_editors
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Zed cache"* ]] || return 1
+    [[ "$output" == *"CLEAN:$HOME/Library/Application Support/Zed/node/cache/_cacache|Zed npm cache"* ]] || return 1
+    [[ "$output" == *"CLEAN:$HOME/Library/Application Support/Zed/node/node-v24.11.0-darwin-arm64/cache/_cacache|Zed npm cache"* ]] || return 1
+    [[ "$output" != *"$HOME/Library/Application Support/Zed/db"* ]] || return 1
+    [[ "$output" != *"node-v24.11.0-darwin-arm64/bin"* ]] || return 1
+    [[ "$output" == *"Zed logs"* ]] || return 1
+}
+
+@test "clean_code_editors includes VS Code WebStorage CacheStorage only" {
+    mkdir -p "$HOME/Library/Application Support/Code/WebStorage/29/CacheStorage/uuid-1"
+    mkdir -p "$HOME/Library/Application Support/Code/WebStorage/29/Local Storage"
+    touch "$HOME/Library/Application Support/Code/WebStorage/29/QuotaManager"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "CLEAN:$1|$2"; }
+clean_code_editors
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$HOME/Library/Application Support/Code/WebStorage/29/CacheStorage/uuid-1|VS Code webview cache"* ]] || return 1
+    [[ "$output" != *"Local Storage"* ]] || return 1
+    [[ "$output" != *"QuotaManager"* ]]
+}
+
+@test "clean_shell_utils includes Warp and Ghostty caches" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+clean_shell_utils
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Warp cache"* ]] || return 1
+    [[ "$output" == *"Warp log"* ]] || return 1
+    [[ "$output" == *"Warp Sentry crash reports"* ]] || return 1
+    [[ "$output" == *"Ghostty cache"* ]]
+}
+
+@test "clean_video_players includes Stremio caches" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p ~/Library/Application\ Support/stremio
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+clean_video_players
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Stremio cache"* ]] || return 1
+    [[ "$output" == *"Stremio server cache"* ]]
+}
+
+@test "clean_video_players cleans SenPlayer videoCache but not sibling data (#1070)" {
+    local sen="$HOME/Library/Containers/com.wuziqi.SenPlayer/Data"
+    mkdir -p "$sen/tmp/videoCache" "$sen/Documents"
+    touch "$sen/tmp/videoCache/segment.mp4" "$sen/Documents/saved.mp4"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { local arg; for arg in "$@"; do printf 'CLEAN:%s\n' "$arg"; done; }
+clean_video_players
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$HOME/Library/Containers/com.wuziqi.SenPlayer/Data/tmp/videoCache/segment.mp4"* &&
+        "$output" != *"SenPlayer/Data/Documents"* ]]
+}
+
+@test "clean_productivity_apps cleans Folo Cache_Data but not sibling data (#1070)" {
+    local folo="$HOME/Library/Containers/is.follow/Data/Library/Application Support/Folo"
+    mkdir -p "$folo/Cache/Cache_Data"
+    touch "$folo/Cache/Cache_Data/blob" "$folo/Cache/other.bin" "$folo/db.sqlite"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { local arg; for arg in "$@"; do printf 'CLEAN:%s\n' "$arg"; done; }
+clean_productivity_apps
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$HOME/Library/Containers/is.follow/Data/Library/Application Support/Folo/Cache/Cache_Data/blob"* &&
+        "$output" != *"Folo/Cache/other.bin"* &&
+        "$output" != *"db.sqlite"* ]]
+}
+
+@test "clean_editor_obsolete_extensions reads JSON when plutil -p rejects raw file (#1512)" {
+    local ext_root="$HOME/.vscode/extensions"
+    mkdir -p "$ext_root/pub.ext-old-1.0.0"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "pub.ext-old-1.0.0": true
+}
+JSON
+
+    local mock_bin="$HOME/bin"
+    mkdir -p "$mock_bin"
+    cat > "$mock_bin/plutil" << 'MOCK'
+#!/bin/bash
+if [[ "$1" == "-p" && "$2" == *"/.obsolete" ]]; then
+    echo "Unexpected character { at line 1" >&2
+    exit 1
+fi
+exec /usr/bin/plutil "$@"
+MOCK
+    chmod +x "$mock_bin/plutil"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$mock_bin:$PATH" \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "CLEAN:$1"; }
+clean_editor_obsolete_extensions
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$HOME/.vscode/extensions/pub.ext-old-1.0.0"* ]] || return 1
+}
+
+@test "clean_editor_obsolete_extensions removes only dirs listed in .obsolete (#910)" {
+    local ext_root="$HOME/.vscode/extensions"
+    mkdir -p "$ext_root/pub.ext-old-1.0.0" "$ext_root/pub.ext-new-1.1.0"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "pub.ext-old-1.0.0": true
+}
+JSON
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "CLEAN:$1"; }
+clean_editor_obsolete_extensions
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$HOME/.vscode/extensions/pub.ext-old-1.0.0"* ]] || return 1
+    [[ "$output" != *"pub.ext-new-1.1.0"* ]]
+}
+
+@test "clean_editor_obsolete_extensions rejects path-traversal keys in .obsolete (#910)" {
+    rm -rf "$HOME/.vscode" "$HOME/.vscode-insiders" "$HOME/.cursor"
+    local ext_root="$HOME/.cursor/extensions"
+    mkdir -p "$ext_root"
+    mkdir -p "$HOME/obsolete-victim"
+    # A legitimate entry alongside the malicious ones. Without it the function has
+    # nothing to clean, output is empty, and "no CLEAN: line" cannot distinguish
+    # "traversal rejected" from "never ran".
+    mkdir -p "$ext_root/publisher.legit-1.0.0"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "../../obsolete-victim": true,
+  "..": true,
+  "publisher.legit-1.0.0": true
+}
+JSON
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "CLEAN:$1"; }
+clean_editor_obsolete_extensions
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$ext_root/publisher.legit-1.0.0"* ]] || return 1
+    [[ "$output" != *"obsolete-victim"* ]] || return 1
+    [[ "$output" != *"CLEAN:$HOME/.cursor\""* ]] || return 1
+    [ -d "$HOME/obsolete-victim" ]
+}
+
+make_extension_dir() {
+    local ext_root="$1" dir_name="$2" publisher="$3" name="$4" version="$5"
+    mkdir -p "$ext_root/$dir_name"
+    printf '{"publisher":"%s","name":"%s","version":"%s"}\n' \
+        "$publisher" "$name" "$version" > "$ext_root/$dir_name/package.json"
+}
+
+write_extension_registry() {
+    local registry="$1"
+    shift
+    mkdir -p "$(dirname "$registry")"
+    {
+        printf '['
+        local first=true dir
+        for dir in "$@"; do
+            [[ "$first" == "true" ]] || printf ','
+            first=false
+            printf '{"relativeLocation":"%s","location":{"path":"/x/%s","scheme":"file"}}' "$dir" "$dir"
+        done
+        printf ']\n'
+    } > "$registry"
+}
+
+run_editor_extension_cleanup() {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "CLEAN:$1"; }
+note_activity() { :; }
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+clean_editor_obsolete_extensions
+EOF
+}
+
+@test "a directory named by .obsolete is not offered twice (#1461)" {
+    rm -rf "$HOME/.vscode" "$HOME/.vscode-insiders" "$HOME/.cursor" "$HOME/Library/Application Support/Code"
+    local ext_root="$HOME/.vscode/extensions"
+    make_extension_dir "$ext_root" "pub.ext-1.0.0" "Pub" "ext" "1.0.0"
+    write_extension_registry "$ext_root/extensions.json" "pub.registered-9.9.9"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "pub.ext-1.0.0": true
+}
+JSON
+    mkdir -p "$HOME/Library/Application Support/Code/User/profiles"
+
+    run_editor_extension_cleanup
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local hits
+    hits=$(printf '%s\n' "$output" | grep -c "CLEAN:$ext_root/pub.ext-1.0.0" || true)
+    [ "$hits" -eq 1 ] || { echo "expected 1 offer, got $hits"; echo "$output"; return 1; }
+    [[ "$output" == *"Obsolete VS Code extension"* ]] || [[ "$output" == *"CLEAN:"* ]]
+}
+
+@test "manual private extensions absent from the registry are preserved (#1461)" {
+    rm -rf "$HOME/.vscode" "$HOME/.vscode-insiders" "$HOME/.cursor" "$HOME/Library/Application Support/Code"
+    local ext_root="$HOME/.vscode/extensions"
+    make_extension_dir "$ext_root" "pub.private-1.0.0" "Pub" "private" "1.0.0"
+    make_extension_dir "$ext_root" "pub.obsolete-0.9.0" "Pub" "obsolete" "0.9.0"
+    write_extension_registry "$ext_root/extensions.json" "pub.registered-9.9.9"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "pub.obsolete-0.9.0": true
+}
+JSON
+    mkdir -p "$HOME/Library/Application Support/Code/User/profiles"
+
+    run_editor_extension_cleanup
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN:$ext_root/pub.obsolete-0.9.0"* ]] || return 1
+    [[ "$output" != *"CLEAN:$ext_root/pub.private-1.0.0"* ]] || return 1
+}
+
+@test "only a root-level .obsolete key marks an extension, never a nested one (#1512)" {
+    # The old parser read `plutil -p` text, which carries no nesting, so a key
+    # inside a nested dict or array came back looking like a top-level
+    # extension directory name. A user whose extensions root happened to hold a
+    # directory of that name had it offered for deletion: a wrong deletion, not
+    # a missed one. RED on V1.55.0, which offers both nested names.
+    rm -rf "$HOME/.vscode" "$HOME/.vscode-insiders" "$HOME/.cursor" "$HOME/Library/Application Support/Code"
+    local ext_root="$HOME/.vscode/extensions"
+    make_extension_dir "$ext_root" "nested-in-dict" "Pub" "nd" "1.0.0"
+    make_extension_dir "$ext_root" "nested-in-array" "Pub" "na" "1.0.0"
+    make_extension_dir "$ext_root" "at-root" "Pub" "rk" "1.0.0"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "outer": { "nested-in-dict": true },
+  "arr": [ { "nested-in-array": true } ],
+  "at-root": true
+}
+JSON
+    mkdir -p "$HOME/Library/Application Support/Code/User/profiles"
+
+    run_editor_extension_cleanup
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN:$ext_root/at-root"* ]] || return 1
+    [[ "$output" != *"CLEAN:$ext_root/nested-in-dict"* ]] || return 1
+    [[ "$output" != *"CLEAN:$ext_root/nested-in-array"* ]] || return 1
+}
+
+@test "an empty .obsolete container does not hide the keys after it (#1512)" {
+    # plutil spells an empty container as a self-closing <dict/> / <array/>.
+    # Counting those as an opening tag desyncs the depth upward and silently
+    # drops every later root key, so the whole cleanup goes quiet. Key order in
+    # the fixture is deliberate: plutil sorts keys, so the real one must sort
+    # last to actually sit behind both empty containers.
+    rm -rf "$HOME/.vscode" "$HOME/.vscode-insiders" "$HOME/.cursor" "$HOME/Library/Application Support/Code"
+    local ext_root="$HOME/.vscode/extensions"
+    make_extension_dir "$ext_root" "zz-after-empty" "Pub" "ae" "1.0.0"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "aa-emptydict": {},
+  "ab-emptyarray": [],
+  "zz-after-empty": true
+}
+JSON
+    mkdir -p "$HOME/Library/Application Support/Code/User/profiles"
+
+    run_editor_extension_cleanup
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN:$ext_root/zz-after-empty"* ]] || return 1
+}
+
+@test ".obsolete keys carrying XML entities resolve to their real names (#1512)" {
+    # plutil escapes &, < and > inside a <key>. Decoding &amp; before the other
+    # two turns a key holding the literal text "&lt;" into a real "<", so the
+    # name no longer matches the directory on disk and the entry is skipped.
+    rm -rf "$HOME/.vscode" "$HOME/.vscode-insiders" "$HOME/.cursor" "$HOME/Library/Application Support/Code"
+    local ext_root="$HOME/.vscode/extensions"
+    make_extension_dir "$ext_root" 'amp&key' "Pub" "am" "1.0.0"
+    make_extension_dir "$ext_root" 'lit&lt;key' "Pub" "li" "1.0.0"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "amp&key": true,
+  "lit&lt;key": true
+}
+JSON
+    mkdir -p "$HOME/Library/Application Support/Code/User/profiles"
+
+    run_editor_extension_cleanup
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN:$ext_root/amp&key"* ]] || return 1
+    [[ "$output" == *"CLEAN:$ext_root/lit&lt;key"* ]] || return 1
+}
+
+@test "a .obsolete value must be boolean true, not 1 or the string true (#1512)" {
+    # The journal marks an entry stale with a boolean. Widening the match to
+    # accept anything that merely prints as 1 (which is how macOS 15 renders a
+    # boolean) would also accept a real integer, so the type has to come from
+    # the XML tag rather than from rendered text.
+    rm -rf "$HOME/.vscode" "$HOME/.vscode-insiders" "$HOME/.cursor" "$HOME/Library/Application Support/Code"
+    local ext_root="$HOME/.vscode/extensions"
+    make_extension_dir "$ext_root" "val-int-one" "Pub" "vi" "1.0.0"
+    make_extension_dir "$ext_root" "val-string-true" "Pub" "vs" "1.0.0"
+    make_extension_dir "$ext_root" "val-false" "Pub" "vf" "1.0.0"
+    make_extension_dir "$ext_root" "val-true" "Pub" "vt" "1.0.0"
+    cat > "$ext_root/.obsolete" << 'JSON'
+{
+  "val-int-one": 1,
+  "val-string-true": "true",
+  "val-false": false,
+  "val-true": true
+}
+JSON
+    mkdir -p "$HOME/Library/Application Support/Code/User/profiles"
+
+    run_editor_extension_cleanup
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN:$ext_root/val-true"* ]] || return 1
+    [[ "$output" != *"CLEAN:$ext_root/val-int-one"* ]] || return 1
+    [[ "$output" != *"CLEAN:$ext_root/val-string-true"* ]] || return 1
+    [[ "$output" != *"CLEAN:$ext_root/val-false"* ]] || return 1
+}
+
+@test "clean_code_editors includes CodeBuddy Extension caches when directory exists" {
+    mkdir -p "$HOME/Library/Application Support/CodeBuddyExtension"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+clean_code_editors
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CodeBuddy Extension cache"* ]] || return 1
+    [[ "$output" == *"CodeBuddy Extension logs"* ]]
+}
+
+@test "clean_code_editors includes CodeBuddy CN caches when directory exists" {
+    mkdir -p "$HOME/Library/Application Support/CodeBuddy CN"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+clean_code_editors
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CodeBuddy CN cache"* ]] || return 1
+    [[ "$output" == *"CodeBuddy CN logs"* ]] || return 1
+    [[ "$output" == *"CodeBuddy CN GPU cache"* ]]
+}
+
+@test "clean_code_editors skips CodeBuddy when directories are absent" {
+    rm -rf "$HOME/Library/Application Support/CodeBuddyExtension" "$HOME/Library/Application Support/CodeBuddy CN"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+clean_code_editors
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"CodeBuddy"* ]]
+}
+
+@test "clean_media_players includes QQ Music Mac container caches" {
+    mkdir -p "$HOME/Library/Containers/com.tencent.QQMusicMac/Data/Library/Application Support/QQMusicMac"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+clean_media_players
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"QQ Music Mac cache"* ]] || return 1
+    [[ "$output" == *"QQ Music streaming cache"* ]] || return 1
+    [[ "$output" == *"QQ Music logs"* ]] || return 1
+    [[ "$output" == *"QQ Music container cache"* ]]
+}
+
+@test "clean_media_players does not reference iDownloadProxy" {
+    mkdir -p "$HOME/Library/Containers/com.tencent.QQMusicMac/Data/Library/Application Support/QQMusicMac"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$1 $2"; }
+clean_media_players
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"iDownloadProxy"* ]]
+}
+
+@test "clean_video_players includes Tencent Video container caches" {
+    mkdir -p "$HOME/Library/Containers/com.tencent.tenvideo/Data/Library/Application Support"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+clean_video_players
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Tencent Video old installer"* ]] || return 1
+    [[ "$output" == *"Tencent Video native cache"* ]] || return 1
+    [[ "$output" == *"Tencent Video document cache"* ]]
+}
+
+@test "clean_productivity_apps includes Spacedrive thumbnail cache" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+safe_clean() { echo "$2"; }
+clean_productivity_apps
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Spacedrive thumbnail cache"* ]]
+}
+
+@test "clean_neatdm_stale_segments removes segments older than threshold" {
+    local neatdm_dir="$HOME/Library/Application Support/com.NeatDownloadManager"
+    rm -rf "$neatdm_dir"
+    mkdir -p "$neatdm_dir/12345"
+    touch "$neatdm_dir/12345/seg.x0"
+    # Set mtime to 31 days ago
+    touch -t "$(date -v-31d '+%Y%m%d%H%M.%S')" "$neatdm_dir/12345/seg.x0"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+note_activity() { :; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+clean_neatdm_stale_segments
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"NeatDM stale downloads"* ]] || return 1
+    [[ "$output" == *"1 items"* ]]
+}
+
+@test "clean_neatdm_stale_segments skips recent segments" {
+    local neatdm_dir="$HOME/Library/Application Support/com.NeatDownloadManager"
+    rm -rf "$neatdm_dir"
+    mkdir -p "$neatdm_dir/67890"
+    touch "$neatdm_dir/67890/seg.x0"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+note_activity() { :; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+clean_neatdm_stale_segments
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"NeatDM stale downloads"* ]] || return 1
+    # The absence of a label is weak evidence on its own: this run prints nothing at
+    # all, so assert the survival the test is actually named for.
+    [ -f "$neatdm_dir/67890/seg.x0" ]
+    [ -d "$neatdm_dir/67890" ]
+}
+
+@test "clean_neatdm_stale_segments skips non-numeric segment-like directories" {
+    local neatdm_dir="$HOME/Library/Application Support/com.NeatDownloadManager"
+    rm -rf "$neatdm_dir"
+    mkdir -p "$neatdm_dir/history-backup"
+    touch "$neatdm_dir/history-backup/seg.x0"
+    touch -t "$(date -v-31d '+%Y%m%d%H%M.%S')" "$neatdm_dir/history-backup/seg.x0"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+note_activity() { :; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+clean_neatdm_stale_segments
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"NeatDM stale downloads"* ]] || return 1
+    # This path prints nothing, so the absence check alone cannot fail. Assert the
+    # survival the test is named for.
+    [ -f "$neatdm_dir/history-backup/seg.x0" ]
+    [ -d "$neatdm_dir/history-backup" ]
+}
+
+@test "clean_neatdm_stale_segments skips when directory absent" {
+    rm -rf "$HOME/Library/Application Support/com.NeatDownloadManager"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+clean_neatdm_stale_segments
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ -z "$output" ]]
+}
+
+@test "clean_launcher_apps does not touch Raycast cache" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+mkdir -p "$HOME/Library/Caches/com.raycast.macos/urlcache"
+mkdir -p "$HOME/Library/Caches/com.raycast.macos/fsCachedData"
+safe_clean() { echo "CLEAN:$2|$1"; }
+clean_launcher_apps
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Raycast"* ]] && [[ "$output" != *"raycast"* ]]
+}
+
+@test "Xcode DerivedData cleanup keeps deleting through a size timeout and stops on a signal" {
+    # Sizing only feeds the freed total (bugs reference, section 15): a timeout
+    # leaves the project eligible and marks the total partial, a signal stops
+    # the run before any deletion.
+    local isolated_home="$HOME/xcode-derived-timeout"
+    mkdir -p "$isolated_home/Library/Developer/Xcode/DerivedData/App-abc"
+
+    run env HOME="$isolated_home" PROJECT_ROOT="$PROJECT_ROOT" \
+        MOLE_CURRENT_COMMAND=clean /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+DRY_RUN=false
+_xcode_cleanup_process_state() { return 1; }
+safe_remove() { echo "DELETE:$1"; }
+note_activity() { :; }
+for size_status in 124 130; do
+    MOLE_CLEAN_CANCEL_STATUS=0
+    MOLE_CLEAN_SIZING_TIMEOUTS=0
+    eval "get_path_size_kb() { return $size_status; }"
+    rc=0
+    clean_xcode_derived_data || rc=$?
+    printf 'SIZE=%s RC=%s CANCEL=%s PARTIAL=%s\n' "$size_status" "$rc" \
+        "$MOLE_CLEAN_CANCEL_STATUS" "$MOLE_CLEAN_SIZING_TIMEOUTS"
+done
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DELETE:$isolated_home/Library/Developer/Xcode/DerivedData/App-abc"*"SIZE=124 RC=0 CANCEL=0 PARTIAL=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SIZE=130 RC=130 CANCEL=130 PARTIAL=0"* ]] || { echo "$output"; return 1; }
+    [[ "$(printf '%s\n' "$output" | grep -c '^DELETE:')" -eq 1 ]]
+}
+
+@test "clean_3d_tools skips Autodesk cache while AcCoreConsole is running (#1390)" {
+    mkdir -p "$HOME/Library/Caches/com.autodesk.AcCoreConsole"
+    touch "$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db"
+    touch "$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db-shm"
+    touch "$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db-wal"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() {
+    if [[ "$*" == *AcCoreConsole* ]] || [[ "$*" == *com.autodesk.* ]]; then
+        return 0
+    fi
+    return 1
+}
+safe_clean() {
+    local desc="${*: -1}"
+    case "$desc" in
+        "Autodesk cache") echo "UNEXPECTED_AUTODESK:$desc" ;;
+    esac
+}
+safe_clean_guarded() { echo "UNEXPECTED_GUARDED:$*"; }
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+note_activity() { :; }
+clean_3d_tools
+INNER
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DEFER:Autodesk"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_AUTODESK"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_GUARDED"* ]] || return 1
+    [[ -f "$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db" ]]
+}
+
+@test "clean_3d_tools removes Autodesk cache when no Autodesk process is running" {
+    rm -rf "$HOME/Library/Caches/com.autodesk.AcCoreConsole"
+    mkdir -p "$HOME/Library/Caches/com.autodesk.AcCoreConsole"
+    touch "$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+safe_clean() {
+    local desc="${*: -1}"
+    echo "SAFE_CLEAN:$desc"
+    local arg
+    for arg in "${@:1:$#-1}"; do
+        echo "PATH:$arg"
+    done
+}
+safe_clean_guarded() { shift; safe_clean "$@"; }
+note_activity() { :; }
+clean_3d_tools
+INNER
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SAFE_CLEAN:Autodesk cache"* ]] || return 1
+    [[ "$output" == *"PATH:"*"com.autodesk.AcCoreConsole"* ]] || return 1
+}
+
+@test "safe_remove refuses a live reverse-DNS user cache (#1390)" {
+    mkdir -p "$HOME/Library/Caches/com.autodesk.AcCoreConsole"
+    local db="$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db"
+    touch "$db"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=0 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+# The owner probe reads one `ps` snapshot rather than forking pgrep per
+# candidate, so a live helper is simulated by the table it would appear in.
+ps() {
+    cat <<'TABLE'
+  PID  PPID COMM             ARGS
+  901     1 /Applications/Autodesk Fusion.app/Contents/MacOS/AcCoreConsole /Applications/Autodesk Fusion.app/Contents/MacOS/AcCoreConsole
+TABLE
+}
+oplog_enabled() { return 1; }
+log_operation() { :; }
+debug_log() { :; }
+db="$HOME/Library/Caches/com.autodesk.AcCoreConsole/Cache.db"
+set +e
+safe_remove "$db" true
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || exit 1
+[[ -f "$db" ]]
+INNER
+
+    [ "$status" -eq 0 ]
+    [[ -f "$db" ]]
+}
+
+@test "safe_remove deletes an idle reverse-DNS user cache" {
+    mkdir -p "$HOME/Library/Caches/com.example.idleapp"
+    local db="$HOME/Library/Caches/com.example.idleapp/Cache.db"
+    touch "$db"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=0 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_MOLE_COMPLETE_LSOF_MODE=direct
+pgrep() { return 1; }
+lsof() { return 1; }
+oplog_enabled() { return 1; }
+log_operation() { :; }
+debug_log() { :; }
+validate_path_for_deletion() { return 0; }
+db="$HOME/Library/Caches/com.example.idleapp/Cache.db"
+safe_remove "$db" true
+[[ ! -e "$db" ]]
+INNER
+
+    [ "$status" -eq 0 ]
+    [[ ! -e "$db" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles removes only strictly older versions and keeps every staged version" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    local staged_one="$prod/cccccccccccccccccccccccccccccccccccccccc"
+    local staged_two="$prod/dddddddddddddddddddddddddddddddddddddddd"
+    local equal="$prod/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    make_fusion_version_dir "$staged_one" "2.0.300"
+    make_fusion_version_dir "$staged_two" "3.0.1"
+    make_fusion_version_dir "$equal" "2.0.200"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=0 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+get_path_size_kb() { echo "1024"; }
+note_activity() { :; }
+debug_log() { :; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ ! -d "$old" ]] || return 1
+    [[ -d "$current" && -d "$staged_one" && -d "$staged_two" && -d "$equal" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles preserves non-hash and unverified siblings" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    local wrong_id="$prod/cccccccccccccccccccccccccccccccccccccccc"
+    local no_app="$prod/dddddddddddddddddddddddddddddddddddddddd"
+    local no_executable="$prod/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    local non_hash="$prod/cache"
+    local external="$HOME/fusion-external-version"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    make_fusion_version_dir "$wrong_id" "2.0.50" "com.example.not-fusion"
+    make_fusion_version_dir "$no_executable" "2.0.25"
+    rm "$no_executable/Autodesk Fusion.app/Contents/MacOS/Autodesk Fusion"
+    mkdir -p "$no_app/config" "$non_hash"
+    make_fusion_version_dir "$non_hash" "2.0.1"
+    make_fusion_version_dir "$external" "2.0.1"
+    ln -s "$external" "$prod/ffffffffffffffffffffffffffffffffffffffff"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=0 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+get_path_size_kb() { echo "1"; }
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ ! -d "$old" ]] || return 1
+    [[ -d "$wrong_id" && -d "$no_app" && -d "$no_executable" && -d "$non_hash" && -L "$prod/ffffffffffffffffffffffffffffffffffffffff" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles refuses a symlinked production root" {
+    local autodesk="$HOME/Library/Application Support/Autodesk"
+    local external="$HOME/outside-fusion-production"
+    rm -rf "$autodesk" "$external"
+    mkdir -p "$autodesk/webdeploy" "$external"
+    local current="$external/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$external/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$external/Autodesk Fusion.app"
+    ln -s "$external" "$autodesk/webdeploy/production"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"production root not trusted"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles skips when Autodesk is running" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 0; }
+get_path_size_kb() { echo "1024"; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER:Autodesk Fusion"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles skips while the Autodesk streamer updater is running" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { [[ "$*" == *streamer* ]]; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+mole_defer_cleanup_family() { echo "DEFER:$1"; }
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER:Autodesk Fusion"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles skips when Autodesk process state is unknown" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+autodesk_cache_process_state() { return 2; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"skipped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles skips when current alias is broken" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Autodesk Fusion.app" \
+        "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+safe_remove() { echo "UNEXPECTED_REMOVE:$1"; return 0; }
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"current version unknown"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_REMOVE"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles stops when the current alias changes during sizing" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=0 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+get_path_size_kb() {
+    local alias="$HOME/Library/Application Support/Autodesk/webdeploy/production/Autodesk Fusion.app"
+    rm "$alias"
+    ln -s "$1/Autodesk Fusion.app" "$alias"
+    echo "1"
+}
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"stopped (current version changed)"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles stops when Autodesk starts during sizing" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=0 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+marker="$HOME/autodesk-started"
+pgrep() { [[ -e "$marker" ]]; }
+get_path_size_kb() { : > "$marker"; echo "1"; }
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"stopped (Autodesk started)"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles rejects a candidate replaced during sizing" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk" "$HOME/fusion-replacement"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    local replacement="$HOME/fusion-replacement"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    make_fusion_version_dir "$replacement" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_DRY_RUN=0 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+old="$HOME/Library/Application Support/Autodesk/webdeploy/production/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+pgrep() { return 1; }
+get_path_size_kb() {
+    mv "$old" "$HOME/original-old-fusion"
+    mv "$HOME/fusion-replacement" "$old"
+    echo "1"
+}
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+INNER
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"stopped (candidate replaced)"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles reports a failed removal and continues" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old_one="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    local old_two="$prod/cccccccccccccccccccccccccccccccccccccccc"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old_one" "2.0.100"
+    make_fusion_version_dir "$old_two" "2.0.150"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+old_one="$HOME/Library/Application Support/Autodesk/webdeploy/production/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+pgrep() { return 1; }
+get_path_size_kb() { echo "1"; }
+safe_remove() {
+    if [[ "$1" == "$old_one" ]]; then
+        return 1
+    fi
+    command rm -rf "$1"
+}
+note_activity() { :; }
+debug_log() { :; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+printf 'COUNTS:%s:%s:%s\n' "$files_cleaned" "$total_size_cleaned" "$total_items"
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"1 failed"* ]] || return 1
+    [[ "$output" == *"COUNTS:1:1:1"* ]] || return 1
+    [[ -d "$old_one" && ! -d "$old_two" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles avoids a duplicate real-mode post-size guard" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+get_path_size_kb() { echo "1"; }
+guard_calls=0
+_autodesk_fusion_delete_guard_allows() {
+    guard_calls=$((guard_calls + 1))
+    return 0
+}
+safe_remove() {
+    local final_guard="${_MOLE_SAFE_REMOVE_FINAL_GUARD:-}"
+    [[ -n "$final_guard" ]] || return 99
+    "$final_guard" "$1" || return $?
+    command rm -rf "$1"
+}
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+clean_autodesk_fusion_old_bundles
+printf 'GUARD_CALLS:%s\n' "$guard_calls"
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"GUARD_CALLS:2"* ]] || return 1
+    [[ ! -d "$old" ]]
+}
+
+@test "clean_autodesk_fusion_old_bundles propagates a final sink interrupt" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_CURRENT_COMMAND=clean /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+pgrep() { return 1; }
+get_path_size_kb() { echo "1"; }
+guard_calls=0
+_autodesk_fusion_delete_guard_allows() {
+    guard_calls=$((guard_calls + 1))
+    [[ $guard_calls -lt 2 ]] && return 0
+    _MOLE_AUTODESK_FUSION_GUARD_REASON="interrupted"
+    return 130
+}
+note_activity() { :; }
+debug_log() { :; }
+DRY_RUN=false
+MOLE_CLEAN_CANCEL_STATUS=0
+set +e
+clean_autodesk_fusion_old_bundles
+cleanup_rc=$?
+set -e
+printf 'RC:%s CANCEL:%s CALLS:%s\n' \
+    "$cleanup_rc" "$MOLE_CLEAN_CANCEL_STATUS" "$guard_calls"
+[[ $cleanup_rc -eq 130 ]]
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"RC:130 CANCEL:130 CALLS:2"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "Autodesk Fusion final guard catches the streamer starting during metadata probes" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+marker="$HOME/streamer-started"
+autodesk_cache_process_state() { [[ -e "$marker" ]]; }
+_autodesk_fusion_resolve_current_version() {
+    _MOLE_AUTODESK_FUSION_RESOLVED_DIR="$current"
+    _MOLE_AUTODESK_FUSION_RESOLVED_VERSION="2.0.200"
+    : > "$marker"
+}
+_mole_snapshot_path_identity "$old"
+_MOLE_AUTODESK_FUSION_GUARD_ROOT="$prod"
+_MOLE_AUTODESK_FUSION_GUARD_CURRENT_DIR="$current"
+_MOLE_AUTODESK_FUSION_GUARD_CURRENT_VERSION="2.0.200"
+_MOLE_AUTODESK_FUSION_GUARD_DEADLINE=$((SECONDS + 10))
+_MOLE_AUTODESK_FUSION_GUARD_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+_MOLE_AUTODESK_FUSION_GUARD_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+_MOLE_AUTODESK_FUSION_GUARD_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+set +e
+_autodesk_fusion_delete_guard_allows "$old"
+guard_rc=$?
+set -e
+printf 'RC:%s REASON:%s\n' "$guard_rc" "$_MOLE_AUTODESK_FUSION_GUARD_REASON"
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"RC:1 REASON:Autodesk started"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "Autodesk Fusion final guard catches the current alias switching during candidate probes" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+alias_path="$prod/Autodesk Fusion.app"
+pgrep() { return 1; }
+plutil_counter="$HOME/plutil-counter"
+: > "$plutil_counter"
+run_with_timeout() {
+    shift
+    if [[ "$1" == "/usr/bin/plutil" ]]; then
+        local plutil_calls
+        plutil_calls=$(wc -l < "$plutil_counter")
+        plutil_calls=$((plutil_calls + 1))
+        printf '%s\n' "$plutil_calls" >> "$plutil_counter"
+        if [[ $plutil_calls -eq 4 ]]; then
+            rm "$alias_path"
+            ln -s "$old/Autodesk Fusion.app" "$alias_path"
+        fi
+    fi
+    "$@"
+}
+_mole_snapshot_path_identity "$old"
+_MOLE_AUTODESK_FUSION_GUARD_ROOT="$prod"
+_MOLE_AUTODESK_FUSION_GUARD_CURRENT_DIR="$current"
+_MOLE_AUTODESK_FUSION_GUARD_CURRENT_VERSION="2.0.200"
+_MOLE_AUTODESK_FUSION_GUARD_DEADLINE=$((SECONDS + 10))
+_MOLE_AUTODESK_FUSION_GUARD_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+_MOLE_AUTODESK_FUSION_GUARD_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+_MOLE_AUTODESK_FUSION_GUARD_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+set +e
+_autodesk_fusion_delete_guard_allows "$old"
+guard_rc=$?
+set -e
+plutil_calls=$(wc -l < "$plutil_counter" | tr -d '[:space:]')
+printf 'RC:%s REASON:%s PLUTIL:%s\n' \
+    "$guard_rc" "$_MOLE_AUTODESK_FUSION_GUARD_REASON" "$plutil_calls"
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"RC:1 REASON:current version changed"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "Autodesk Fusion final guard catches the current alias switching during its final process probe" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+alias_path="$prod/Autodesk Fusion.app"
+process_calls=0
+autodesk_cache_process_state() {
+    process_calls=$((process_calls + 1))
+    if [[ $process_calls -eq 2 ]]; then
+        rm "$alias_path"
+        ln -s "$old/Autodesk Fusion.app" "$alias_path"
+    fi
+    return 1
+}
+_mole_snapshot_path_identity "$old"
+_MOLE_AUTODESK_FUSION_GUARD_ROOT="$prod"
+_MOLE_AUTODESK_FUSION_GUARD_CURRENT_DIR="$current"
+_MOLE_AUTODESK_FUSION_GUARD_CURRENT_VERSION="2.0.200"
+_MOLE_AUTODESK_FUSION_GUARD_DEADLINE=$((SECONDS + 10))
+_MOLE_AUTODESK_FUSION_GUARD_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+_MOLE_AUTODESK_FUSION_GUARD_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+_MOLE_AUTODESK_FUSION_GUARD_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+set +e
+_autodesk_fusion_delete_guard_allows "$old"
+guard_rc=$?
+set -e
+printf 'RC:%s REASON:%s PROCESS:%s\n' \
+    "$guard_rc" "$_MOLE_AUTODESK_FUSION_GUARD_REASON" "$process_calls"
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"RC:1 REASON:current version changed PROCESS:2"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "Autodesk Fusion final current resolver rebinds the alias after metadata probes" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    local old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    make_fusion_version_dir "$current" "2.0.200"
+    make_fusion_version_dir "$old" "2.0.100"
+    ln -s "$current/Autodesk Fusion.app" "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+old="$prod/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+alias_path="$prod/Autodesk Fusion.app"
+pgrep() { return 1; }
+plutil_counter="$HOME/final-resolver-plutil-counter"
+: > "$plutil_counter"
+run_with_timeout() {
+    shift
+    if [[ "$1" == "/usr/bin/plutil" ]]; then
+        local plutil_calls
+        plutil_calls=$(wc -l < "$plutil_counter")
+        plutil_calls=$((plutil_calls + 1))
+        printf '%s\n' "$plutil_calls" >> "$plutil_counter"
+        if [[ $plutil_calls -eq 7 ]]; then
+            rm "$alias_path"
+            ln -s "$old/Autodesk Fusion.app" "$alias_path"
+        fi
+    fi
+    "$@"
+}
+_mole_snapshot_path_identity "$old"
+_MOLE_AUTODESK_FUSION_GUARD_ROOT="$prod"
+_MOLE_AUTODESK_FUSION_GUARD_CURRENT_DIR="$current"
+_MOLE_AUTODESK_FUSION_GUARD_CURRENT_VERSION="2.0.200"
+_MOLE_AUTODESK_FUSION_GUARD_DEADLINE=$((SECONDS + 10))
+_MOLE_AUTODESK_FUSION_GUARD_PARENT="$_MOLE_PATH_SNAPSHOT_PARENT"
+_MOLE_AUTODESK_FUSION_GUARD_PARENT_ID="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+_MOLE_AUTODESK_FUSION_GUARD_TARGET_ID="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+set +e
+_autodesk_fusion_delete_guard_allows "$old"
+guard_rc=$?
+set -e
+plutil_calls=$(wc -l < "$plutil_counter" | tr -d '[:space:]')
+printf 'RC:%s REASON:%s PLUTIL:%s\n' \
+    "$guard_rc" "$_MOLE_AUTODESK_FUSION_GUARD_REASON" "$plutil_calls"
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"RC:1 REASON:current version unknown PLUTIL:9"* ]] || return 1
+    [[ -d "$old" ]]
+}
+
+@test "Finder alias resolver passes the alias path as inert argv" {
+    local prod="$HOME/Library/Application Support/Autodesk/webdeploy/production"
+    rm -rf "$HOME/Library/Application Support/Autodesk"
+    local current="$prod/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    make_fusion_version_dir "$current" "2.0.200"
+    touch "$prod/Autodesk Fusion.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+alias_path="$HOME/Library/Application Support/Autodesk/webdeploy/production/Autodesk Fusion.app"
+target="$HOME/Library/Application Support/Autodesk/webdeploy/production/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Autodesk Fusion.app"
+run_with_timeout() {
+    shift
+    if [[ "$1" == "/usr/bin/osascript" ]]; then
+        [[ "${!#}" == "$alias_path" ]] || return 79
+        printf '%s\n' "$target"
+        return 0
+    fi
+    "$@"
+}
+_autodesk_fusion_resolve_current_version \
+    "$HOME/Library/Application Support/Autodesk/webdeploy/production" \
+    "$((SECONDS + 10))"
+printf 'CURRENT:%s|%s\n' \
+    "$_MOLE_AUTODESK_FUSION_RESOLVED_DIR" \
+    "$_MOLE_AUTODESK_FUSION_RESOLVED_VERSION"
+INNER
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"CURRENT:$current|2.0.200"* ]]
+}
+
+@test "clean_wechat_container_caches cleans sandboxed containers and spares chat data" {
+    local iso="$HOME/iso-wechat-targets"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+wechat="$HOME/Library/Containers/com.tencent.xinWeChat/Data"
+wecom="$HOME/Library/Containers/com.tencent.WeWorkMac/Data"
+mkdir -p "$wechat/Documents/app_data/log" "$wechat/.wxapplet/WMPF"
+mkdir -p "$wecom/Library/Application Support/WXWork/Log"
+mkdir -p "$wecom/Documents/cefcache/wew_1/Service Worker/CacheStorage/origin"
+mkdir -p "$wecom/Documents/cefcache/wew_1/Service Worker/Database"
+mkdir -p "$wecom/Documents/cefcache/wew_1/Service Worker/ScriptCache"
+mkdir -p "$wecom/Documents/cefcache/wew_1/Cache"
+mkdir -p "$wecom/Documents/cefcache/wew_1/Code Cache"
+mkdir -p "$wecom/Documents/cefcache/wew_1/GPUCache"
+touch "$wechat/Documents/app_data/log/wechat.log"
+touch "$wechat/.wxapplet/WMPF/mini-program.cache"
+touch "$wecom/Library/Application Support/WXWork/Log/wecom.log"
+touch "$wecom/Documents/cefcache/wew_1/Cache/web.cache"
+touch "$wecom/Documents/cefcache/wew_1/Code Cache/code.cache"
+touch "$wecom/Documents/cefcache/wew_1/GPUCache/gpu.cache"
+# User data siblings that must never be reached.
+mkdir -p "$wechat/Documents/xwechat_files/acct_1/db_storage"
+mkdir -p "$wechat/Documents/app_data/radium/users"
+mkdir -p "$wecom/Documents/Profiles/AAA/Messages1"
+mkdir -p "$wecom/Documents/Profiles/AAA/Publishsys/pkg"
+mkdir -p "$wecom/Documents/cefcache/wew_1/Local Storage"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_running() { return 1; }
+wecom_running() { return 1; }
+safe_clean_guarded() { shift; echo "SC|$*"; }
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"Documents/app_data/log/"*"WeChat logs"* ]] || return 1
+    [[ "$output" == *".wxapplet/WMPF/"*"WeChat mini program cache"* ]] || return 1
+    [[ "$output" == *"WXWork/Log/"*"WeCom logs"* ]] || return 1
+    [[ "$output" == *"cefcache/wew_1/Service Worker/CacheStorage/"*"WeCom service worker cache"* ]] || return 1
+    [[ "$output" == *"cefcache/wew_1/Cache/"*"WeCom web cache"* ]] || return 1
+    [[ "$output" == *"cefcache/wew_1/Code Cache/"*"WeCom code cache"* ]] || return 1
+    [[ "$output" == *"cefcache/wew_1/GPUCache/"*"WeCom GPU cache"* ]] || return 1
+    # Chat databases, account state and unmeasured payloads stay untouched.
+    [[ "$output" != *"xwechat_files"* ]] || return 1
+    [[ "$output" != *"radium/users"* ]] || return 1
+    [[ "$output" != *"Messages1"* ]] || return 1
+    [[ "$output" != *"Publishsys"* ]] || return 1
+    [[ "$output" != *"Local Storage"* ]] || return 1
+    [[ "$output" != *"Service Worker/Database"* ]] || return 1
+    [[ "$output" != *"Service Worker/ScriptCache"* ]] || return 1
+}
+
+@test "clean_wechat_container_caches skips every target while an owner is running" {
+    local iso="$HOME/iso-wechat-running"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+wecom="$HOME/Library/Containers/com.tencent.WeWorkMac/Data"
+mkdir -p "$wecom/Documents/cefcache/wew_1/Cache"
+mkdir -p "$wecom/Library/Application Support/WXWork/Log"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_running() { return 0; }
+wecom_running() { return 0; }
+safe_clean_guarded() { shift; echo "SC|$*"; }
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"SC|"* ]] || return 1
+}
+
+@test "clean_wechat_container_caches fails closed when process state is unknown" {
+    local iso="$HOME/iso-wechat-unknown"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+wecom="$HOME/Library/Containers/com.tencent.WeWorkMac/Data"
+mkdir -p "$wecom/Documents/cefcache/wew_1/Cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_running() { return 1; }
+wecom_running() { return 2; }
+safe_clean_guarded() { shift; echo "SC|$*"; }
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"SC|"* ]] || return 1
+}
+
+@test "clean_wechat_container_caches refuses a symlinked WeCom profile" {
+    local iso="$HOME/iso-wechat-symlink"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+wecom="$HOME/Library/Containers/com.tencent.WeWorkMac/Data"
+mkdir -p "$wecom/Documents/cefcache"
+mkdir -p "$HOME/elsewhere/Cache"
+ln -s "$HOME/elsewhere" "$wecom/Documents/cefcache/wew_evil"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_running() { return 1; }
+wecom_running() { return 1; }
+safe_clean_guarded() { shift; echo "SC|$*"; }
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"elsewhere"* ]] || return 1
+    [[ "$output" != *"wew_evil"* ]] || return 1
+}
+
+@test "clean_wechat_container_caches ignores WeCom component payloads under cefcache" {
+    local iso="$HOME/iso-wechat-components"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+cef="$HOME/Library/Containers/com.tencent.WeWorkMac/Data/Documents/cefcache"
+# A real profile owns Chromium cache directories.
+mkdir -p "$cef/Default/Cache" "$cef/Default/Service Worker/CacheStorage/origin"
+mkdir -p "$cef/wew_1688857906463120/Cache"
+# Component-updater payloads sit beside profiles and hold version directories.
+mkdir -p "$cef/AutofillStates/2024.11.26.0"
+mkdir -p "$cef/CertificateRevocation/2025.6.13.84507" "$cef/CertificateRevocation/Cache"
+mkdir -p "$cef/CookieReadinessList/2024.11.26.0"
+touch "$cef/CertificateRevocation/Cache/component-sentinel"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_running() { return 1; }
+wecom_running() { return 1; }
+safe_clean_guarded() { shift; echo "SC|$*"; }
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"cefcache/Default/Cache/"* ]] || return 1
+    [[ "$output" == *"cefcache/wew_1688857906463120/Cache/"* ]] || return 1
+    [[ "$output" != *"AutofillStates"* ]] || return 1
+    [[ "$output" != *"CertificateRevocation"* ]] || return 1
+    [[ "$output" != *"CookieReadinessList"* ]] || return 1
+}
+
+@test "clean_wechat_container_caches stays quiet when every cache root is empty" {
+    local iso="$HOME/iso-wechat-empty"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+mkdir -p "$HOME/Library/Containers/com.tencent.xinWeChat/Data"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_running() { return 0; }
+wecom_running() { return 1; }
+mole_report_guard_stop() { echo "DEFER"; }
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ -z "$output" ]]
+}
+
+@test "clean_wechat_container_caches does not let a running WeChat block idle WeCom" {
+    local iso="$HOME/iso-messaging-independent"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+wechat="$HOME/Library/Containers/com.tencent.xinWeChat/Data"
+wecom="$HOME/Library/Containers/com.tencent.WeWorkMac/Data"
+mkdir -p "$wechat/Documents/app_data/log" "$wecom/Documents/cefcache/wew_1/Cache"
+touch "$wechat/Documents/app_data/log/wechat.log" "$wecom/Documents/cefcache/wew_1/Cache/wecom.cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_running() { return 0; }
+wecom_running() { return 1; }
+safe_clean_guarded() { shift; echo "SC|$*"; }
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"wechat.log"* ]] || return 1
+    [[ "$output" == *"wecom.cache"* ]]
+}
+
+@test "wecom_running recognizes the localized main process" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+mole_pgrep_any() {
+    while [[ $# -ge 2 ]]; do
+        [[ "$1" == "-x" && "$2" == "企业微信" ]] && return 0
+        shift 2
+    done
+    return 1
+}
+wecom_running
+EOF
+
+    [ "$status" -eq 0 ]
+}
+
+@test "clean_wechat_container_caches refuses a symlinked WeCom cache root" {
+    local iso="$HOME/iso-wecom-cache-symlink"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+profile="$HOME/Library/Containers/com.tencent.WeWorkMac/Data/Documents/cefcache/wew_1"
+mkdir -p "$profile" "$HOME/outside"
+touch "$HOME/outside/private"
+ln -s "$HOME/outside" "$profile/Cache"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_running() { return 1; }
+wecom_running() { return 1; }
+safe_clean_guarded() { shift; echo "SC|$*"; }
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"outside/private"* ]] || return 1
+    [[ "$output" != *"WeCom web cache"* ]]
+}
+
+@test "clean_wechat_container_caches refuses a WeCom cache child symlink" {
+    local iso="$HOME/iso-wecom-cache-child-symlink"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+cache_root="$HOME/Library/Containers/com.tencent.WeWorkMac/Data/Documents/cefcache/wew_1/Cache"
+mkdir -p "$cache_root" "$HOME/outside"
+touch "$HOME/outside/private"
+ln -s "$HOME/outside" "$cache_root/escaped"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_or_wecom_running() { return 1; }
+wechat_running() { return 1; }
+wecom_running() { return 1; }
+safe_clean_guarded() {
+    local guard="$1"
+    local path="$2"
+    "$guard" "$path" && echo "UNSAFE:$path"
+    return 0
+}
+clean_wechat_container_caches
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" != *"UNSAFE:"* ]]
+}
+
+@test "clean_wechat_container_caches refuses a symlinked WeChat Data root" {
+    local iso="$HOME/iso-wechat-data-symlink"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+container="$HOME/Library/Containers/com.tencent.xinWeChat"
+outside="$HOME/outside-data"
+mkdir -p "$container" "$outside/Documents/app_data/log"
+touch "$outside/Documents/app_data/log/private"
+ln -s "$outside" "$container/Data"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+wechat_or_wecom_running() { return 1; }
+_wechat_container_process_guard_allows() { return 0; }
+_mole_should_refuse_live_user_cache_path() { return 1; }
+export MOLE_UNINSTALL_MODE=1
+target="$container/Data/Documents/app_data/log/private"
+_MOLE_SAFE_CLEAN_BOUND_PATH=""
+_MOLE_SAFE_CLEAN_EXPECTED_PARENT=""
+_MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID=""
+_MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID=""
+guard_rc=0
+_wechat_container_delete_guard_allows "$target" || guard_rc=$?
+if [[ $guard_rc -eq 0 ]]; then
+    safe_remove "$target" true 1 "" \
+        "$_MOLE_SAFE_CLEAN_EXPECTED_PARENT" \
+        "$_MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID" \
+        "$_MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID" || true
+fi
+printf 'GUARD:%s EXISTS:%s\n' "$guard_rc" \
+    "$(test -f "$outside/Documents/app_data/log/private" && echo yes || echo no)"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"GUARD:1 EXISTS:yes"* ]]
+}
+
+@test "WeChat delete guard binds an exact in-container candidate" {
+    local iso="$HOME/iso-wechat-binding"
+    run env HOME="$iso" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+cache_root="$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/log"
+target_path="$cache_root/wechat.log"
+mkdir -p "$cache_root"
+touch "$target_path"
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/app_caches.sh"
+_wechat_container_process_guard_allows() { return 0; }
+_MOLE_SAFE_CLEAN_BOUND_PATH=""
+_MOLE_SAFE_CLEAN_EXPECTED_PARENT=""
+_MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID=""
+_MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID=""
+_wechat_container_delete_guard_allows "$target_path"
+printf 'BOUND:%s\nPARENT:%s\n' \
+    "$_MOLE_SAFE_CLEAN_BOUND_PATH" "$_MOLE_SAFE_CLEAN_EXPECTED_PARENT"
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"BOUND:$iso/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/log/wechat.log"* ]] || return 1
+    [[ "$output" == *"PARENT:$iso/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/log"* ]]
+}
+
+@test "obsolete false and nonboolean values preserve installed extensions" {
+    local ext_root="$HOME/.vscode/extensions"
+    mkdir -p "$ext_root/keep-false" "$ext_root/keep-string" "$ext_root/remove-true"
+    printf '%s\n' '{"keep-false":false,"keep-string":"true","remove-true":true}' > "$ext_root/.obsolete"
+    run_editor_extension_cleanup
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"CLEAN:$ext_root/remove-true"* ]] || return 1
+    [[ "$output" != *"CLEAN:$ext_root/keep-"* ]] || return 1
 }
