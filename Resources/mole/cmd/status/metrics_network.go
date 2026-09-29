@@ -16,39 +16,66 @@ import (
 
 var ioCountersFunc = net.IOCounters
 
-func collectIOCountersSafely(pernic bool) (stats []net.IOCountersStat, err error) {
+const (
+	minNetworkSampleInterval = 100 * time.Millisecond
+	networkIPCacheTTL        = 10 * time.Second
+)
+
+var noiseInterfacePrefixes = [...]string{"lo", "awdl", "utun", "llw", "bridge", "gif", "stf", "xhc", "anpi", "ap"}
+
+func collectIOCountersSafely() (stats []net.IOCountersStat, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic collecting network counters: %v", r)
 		}
 	}()
-	return ioCountersFunc(pernic)
+	return ioCountersFunc(true)
 }
 
-func (c *Collector) collectNetwork(now time.Time) ([]NetworkStatus, error) {
-	stats, err := collectIOCountersSafely(true)
+func (c *Collector) primeNetworkCounters(now time.Time) {
+	stats, err := collectIOCountersSafely()
+	if err != nil {
+		return
+	}
+	c.lastNetAt = now
+	for _, s := range stats {
+		c.prevNet[s.Name] = s
+	}
+}
+
+func (c *Collector) collectNetwork(now time.Time) []NetworkStatus {
+	if c.prevNet == nil {
+		c.prevNet = make(map[string]net.IOCountersStat)
+	}
+	if c.rxHistoryBuf == nil {
+		c.rxHistoryBuf = NewRingBuffer(NetworkHistorySize)
+	}
+	if c.txHistoryBuf == nil {
+		c.txHistoryBuf = NewRingBuffer(NetworkHistorySize)
+	}
+
+	stats, err := collectIOCountersSafely()
 	if err != nil {
 		// Some restricted environments can break netstat-backed collectors.
 		// Degrade gracefully to keep status output available.
 		c.rxHistoryBuf.Add(0)
 		c.txHistoryBuf.Add(0)
-		return nil, nil
+		return nil
 	}
 
 	// Map interface IPs.
-	ifAddrs := getInterfaceIPs()
+	ifAddrs := c.getInterfaceIPsCached(now)
 
 	if c.lastNetAt.IsZero() {
 		c.lastNetAt = now
 		for _, s := range stats {
 			c.prevNet[s.Name] = s
 		}
-		return nil, nil
 	}
 
 	elapsed := now.Sub(c.lastNetAt).Seconds()
-	if elapsed <= 0 {
-		elapsed = 1
+	if elapsed < minNetworkSampleInterval.Seconds() {
+		elapsed = minNetworkSampleInterval.Seconds()
 	}
 
 	var result []NetworkStatus
@@ -60,14 +87,8 @@ func (c *Collector) collectNetwork(now time.Time) ([]NetworkStatus, error) {
 		if !ok {
 			continue
 		}
-		rx := float64(cur.BytesRecv-prev.BytesRecv) / 1024.0 / 1024.0 / elapsed
-		tx := float64(cur.BytesSent-prev.BytesSent) / 1024.0 / 1024.0 / elapsed
-		if rx < 0 {
-			rx = 0
-		}
-		if tx < 0 {
-			tx = 0
-		}
+		rx := float64(counterDelta(cur.BytesRecv, prev.BytesRecv)) / 1024.0 / 1024.0 / elapsed
+		tx := float64(counterDelta(cur.BytesSent, prev.BytesSent)) / 1024.0 / 1024.0 / elapsed
 		result = append(result, NetworkStatus{
 			Name:      cur.Name,
 			RxRateMBs: rx,
@@ -98,7 +119,16 @@ func (c *Collector) collectNetwork(now time.Time) ([]NetworkStatus, error) {
 	c.rxHistoryBuf.Add(totalRx)
 	c.txHistoryBuf.Add(totalTx)
 
-	return result, nil
+	return result
+}
+
+func (c *Collector) getInterfaceIPsCached(now time.Time) map[string]string {
+	if c.cachedNetIPs != nil && now.Sub(c.lastNetIPAt) < networkIPCacheTTL {
+		return c.cachedNetIPs
+	}
+	c.cachedNetIPs = getInterfaceIPs()
+	c.lastNetIPAt = now
+	return c.cachedNetIPs
 }
 
 func getInterfaceIPs() map[string]string {
@@ -111,7 +141,7 @@ func getInterfaceIPs() map[string]string {
 		for _, addr := range iface.Addrs {
 			// IPv4 only.
 			if strings.Contains(addr.Addr, ".") && !strings.HasPrefix(addr.Addr, "127.") {
-				ip := strings.Split(addr.Addr, "/")[0]
+				ip, _, _ := strings.Cut(addr.Addr, "/")
 				result[iface.Name] = ip
 				break
 			}
@@ -122,8 +152,7 @@ func getInterfaceIPs() map[string]string {
 
 func isNoiseInterface(name string) bool {
 	lower := strings.ToLower(name)
-	noiseList := []string{"lo", "awdl", "utun", "llw", "bridge", "gif", "stf", "xhc", "anpi", "ap"}
-	for _, prefix := range noiseList {
+	for _, prefix := range noiseInterfacePrefixes {
 		if strings.HasPrefix(lower, prefix) {
 			return true
 		}
@@ -230,7 +259,7 @@ func collectProxyFromScutilOutput(out string) ProxyStatus {
 }
 
 func collectProxyFromTunInterfaces() ProxyStatus {
-	stats, err := net.IOCounters(true)
+	stats, err := collectIOCountersSafely()
 	if err != nil {
 		return ProxyStatus{Enabled: false}
 	}
@@ -252,7 +281,14 @@ func collectProxyFromTunInterfaces() ProxyStatus {
 	if len(activeTun) > 1 {
 		host = activeTun[0] + "+"
 	}
-	return ProxyStatus{Enabled: true, Type: "TUN", Host: host}
+	// Reported as a tunnel, never as a proxy. This branch is only reached when
+	// no proxy is configured in the environment or in scutil, which is exactly
+	// the case where an active `utun` is most likely iCloud Private Relay or a
+	// VPN. Calling that "Proxy TUN" told users something false about a machine
+	// that has no proxy at all.
+	// Keep the existing JSON type value for automation consumers. IsTunnel is
+	// the presentation hint that lets the terminal UI use an honest label.
+	return ProxyStatus{Enabled: true, Type: "TUN", Host: host, IsTunnel: true}
 }
 
 func scutilProxyEnabled(out, key string) bool {

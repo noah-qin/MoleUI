@@ -102,9 +102,26 @@ paginated_multi_select() {
         fi
     }
 
+    # Save the caller's EXIT/INT/TERM traps so cleanup restores rather than
+    # clears them; a bare `trap - EXIT` here drops an outer handler such as
+    # bin/uninstall.sh's session-end oplog writer. See menu_paginated.sh.
+    local _menu_saved_exit _menu_saved_int _menu_saved_term
+    _menu_saved_exit=$(trap -p EXIT)
+    _menu_saved_int=$(trap -p INT)
+    _menu_saved_term=$(trap -p TERM)
+    # Uses :- defaults: cleanup() is the EXIT trap and may fire once more at
+    # shell exit after this function returned and the saved-trap locals are
+    # gone. See menu_paginated.sh.
+    # shellcheck disable=SC2329
+    _menu_restore_traps() {
+        if [[ -n "${_menu_saved_exit:-}" ]]; then eval "${_menu_saved_exit}"; else trap - EXIT; fi
+        if [[ -n "${_menu_saved_int:-}" ]]; then eval "${_menu_saved_int}"; else trap - INT; fi
+        if [[ -n "${_menu_saved_term:-}" ]]; then eval "${_menu_saved_term}"; else trap - TERM; fi
+    }
+
     # Cleanup function
     cleanup() {
-        trap - EXIT INT TERM
+        _menu_restore_traps
         restore_terminal
     }
 
@@ -212,7 +229,7 @@ paginated_multi_select() {
 
         # Clear any remaining lines at bottom
         printf "${clear_line}\n" >&2
-        printf "${clear_line}${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN} | Space | Enter | Q Exit${NC}\n" >&2
+        printf "${clear_line}${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN} | Space | Enter Save | Q Cancel${NC}\n" >&2
 
         # Clear one more line to ensure no artifacts
         printf "${clear_line}" >&2
@@ -279,6 +296,13 @@ paginated_multi_select() {
                     selected[i]=false
                 done
                 ;;
+            "LEFT" | "RIGHT")
+                # menu_simple is non-paginated; LEFT/RIGHT (h/l) have no
+                # navigation meaning here. Swallow them silently so set -e in
+                # callers doesn't trip and so a stray Vim user doesn't see a
+                # spurious cursor jump.
+                :
+                ;;
             "ENTER")
                 # Store result in global variable instead of returning via stdout
                 local -a selected_indices=()
@@ -296,8 +320,8 @@ paginated_multi_select() {
                     final_result="${selected_indices[*]}"
                 fi
 
-                # Remove the trap to avoid cleanup on normal exit
-                trap - EXIT INT TERM
+                # Restore the caller's traps on normal exit (see above).
+                _menu_restore_traps
 
                 # Store result in global variable
                 MOLE_SELECTION_RESULT="$final_result"

@@ -8,40 +8,48 @@ if [[ -n "${MOLE_PURGE_SHARED_LOADED:-}" ]]; then
 fi
 readonly MOLE_PURGE_SHARED_LOADED=1
 
+MOLE_PURGE_PHYSICAL_HOME="$HOME"
+if [[ -d "$HOME" ]]; then
+    MOLE_PURGE_PHYSICAL_HOME=$(cd "$HOME" 2> /dev/null && pwd -P) || MOLE_PURGE_PHYSICAL_HOME="$HOME"
+fi
+readonly MOLE_PURGE_PHYSICAL_HOME
+
 # Canonical purge targets (heavy project build artifacts).
 readonly MOLE_PURGE_TARGETS=(
     "node_modules"
-    "target"        # Rust, Maven
-    "build"         # Gradle, various
-    "dist"          # JS builds
-    "venv"          # Python
-    ".venv"         # Python
-    ".pytest_cache" # Python (pytest)
-    ".mypy_cache"   # Python (mypy)
-    ".tox"          # Python (tox virtualenvs)
-    ".nox"          # Python (nox virtualenvs)
-    ".ruff_cache"   # Python (ruff)
-    ".gradle"       # Gradle local
-    "__pycache__"   # Python
-    ".next"         # Next.js
-    ".nuxt"         # Nuxt.js
-    ".output"       # Nuxt.js
-    "vendor"        # PHP Composer
-    "bin"           # .NET build output (guarded; see is_protected_purge_artifact)
-    "obj"           # C# / Unity
-    ".turbo"        # Turborepo cache
-    ".parcel-cache" # Parcel bundler
-    ".dart_tool"    # Flutter/Dart build cache
-    ".zig-cache"    # Zig
-    "zig-out"       # Zig
-    ".angular"      # Angular
-    ".svelte-kit"   # SvelteKit
-    ".astro"        # Astro
-    "coverage"      # Code coverage reports
-    "DerivedData"   # Xcode
-    "Pods"          # CocoaPods
-    ".cxx"          # React Native Android NDK build cache
-    ".expo"         # Expo
+    "target"            # Rust, Maven
+    "build"             # Gradle, various
+    "dist"              # JS builds
+    "venv"              # Python
+    ".venv"             # Python
+    ".pytest_cache"     # Python (pytest)
+    ".mypy_cache"       # Python (mypy)
+    ".tox"              # Python (tox virtualenvs)
+    ".nox"              # Python (nox virtualenvs)
+    ".ruff_cache"       # Python (ruff)
+    ".gradle"           # Gradle local
+    ".terragrunt-cache" # Terragrunt downloaded modules/providers
+    "__pycache__"       # Python
+    ".next"             # Next.js
+    ".nuxt"             # Nuxt.js
+    ".output"           # Nuxt.js
+    "vendor"            # PHP Composer
+    "bin"               # .NET build output (guarded; see is_protected_purge_artifact)
+    "obj"               # C# / Unity
+    ".turbo"            # Turborepo cache
+    ".parcel-cache"     # Parcel bundler
+    ".dart_tool"        # Flutter/Dart build cache
+    ".zig-cache"        # Zig
+    "zig-out"           # Zig
+    ".angular"          # Angular
+    ".svelte-kit"       # SvelteKit
+    ".astro"            # Astro
+    "coverage"          # Code coverage reports
+    "DerivedData"       # Xcode
+    "Pods"              # CocoaPods
+    ".cxx"              # React Native Android NDK build cache
+    ".expo"             # Expo
+    ".build"            # Swift Package Manager
 )
 
 readonly MOLE_PURGE_DEFAULT_SEARCH_PATHS=(
@@ -53,6 +61,15 @@ readonly MOLE_PURGE_DEFAULT_SEARCH_PATHS=(
     "$HOME/Workspace"
     "$HOME/Repos"
     "$HOME/Development"
+    "$HOME/Library/CloudStorage"
+    # AI agent worktree containers. These sit under dot directories, which
+    # discover_project_dirs cannot reach: it globs "$HOME"/*/ and
+    # is_project_container rejects any basename starting with a dot. Listing
+    # the exact containers keeps the checkouts inside them in scope for
+    # rebuildable-artifact cleanup without widening discovery to dot
+    # directories in general. The worktrees themselves are never removed.
+    "$HOME/.codex/worktrees"
+    "$HOME/.claude/worktrees"
 )
 
 readonly MOLE_PURGE_MONOREPO_INDICATORS=(
@@ -60,6 +77,10 @@ readonly MOLE_PURGE_MONOREPO_INDICATORS=(
     "pnpm-workspace.yaml"
     "nx.json"
     "rush.json"
+    # A repository or worktree is the project-wide ownership boundary even
+    # when nested packages have their own manifests. Keep .git in the project
+    # indicators too because container discovery consumes that list directly.
+    ".git"
 )
 
 readonly MOLE_PURGE_PROJECT_INDICATORS=(
@@ -70,20 +91,59 @@ readonly MOLE_PURGE_PROJECT_INDICATORS=(
     "requirements.txt"
     "pom.xml"
     "build.gradle"
+    "terragrunt.hcl"
     "Gemfile"
     "composer.json"
     "pubspec.yaml"
+    "Package.swift" # Swift Package Manager
     "Makefile"
     "build.zig"
     "build.zig.zon"
     ".git"
 )
 
+readonly MOLE_CACHEDIR_TAG_NAME="CACHEDIR.TAG"
+readonly MOLE_CACHEDIR_TAG_SIGNATURE="Signature: 8a477f597d28d172789f06886806bc55"
+
+# Normalize an integer or fractional timeout into the whole-second budget used
+# by SECONDS. Shared by clean's project-cache scan and purge's size pool so both
+# keep fractional overrides without duplicating deadline arithmetic.
+mole_purge_timeout_budget_seconds() {
+    local fallback_seconds="${2:-30}"
+    [[ "$fallback_seconds" =~ ^[1-9][0-9]*$ ]] || fallback_seconds=30
+    local timeout_seconds="${1:-$fallback_seconds}"
+    if [[ ! "$timeout_seconds" =~ ^[0-9]+(\.[0-9]+)?$ || "$timeout_seconds" =~ ^0+(\.0+)?$ ]]; then
+        timeout_seconds="$fallback_seconds"
+    fi
+
+    local timeout_whole="${timeout_seconds%%.*}"
+    local timeout_budget=$((10#$timeout_whole))
+    if [[ "$timeout_seconds" == *.* && "${timeout_seconds#*.}" =~ [1-9] ]]; then
+        timeout_budget=$((timeout_budget + 1))
+    fi
+    [[ $timeout_budget -ge 2 ]] || timeout_budget=2
+    printf '%s\n' "$timeout_budget"
+}
+
 # High-noise targets intentionally excluded from quick hint scans in mo clean.
 readonly MOLE_PURGE_QUICK_HINT_EXCLUDED_TARGETS=(
     "bin"
     "vendor"
 )
+
+mole_purge_is_cloud_synced_path() {
+    local path="${1:-}"
+    [[ -n "$path" ]] || return 1
+
+    case "$path" in
+        "$HOME/Library/CloudStorage" | "$HOME/Library/CloudStorage/"* | "$HOME/Library/Mobile Documents" | "$HOME/Library/Mobile Documents/"* | \
+            "$MOLE_PURGE_PHYSICAL_HOME/Library/CloudStorage" | "$MOLE_PURGE_PHYSICAL_HOME/Library/CloudStorage/"* | "$MOLE_PURGE_PHYSICAL_HOME/Library/Mobile Documents" | "$MOLE_PURGE_PHYSICAL_HOME/Library/Mobile Documents/"*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
 
 mole_purge_is_project_root() {
     local dir="$1"
@@ -104,6 +164,16 @@ mole_purge_is_project_root() {
     return 1
 }
 
+mole_dir_has_cachedir_tag() {
+    local dir="$1"
+    local tag="$dir/$MOLE_CACHEDIR_TAG_NAME"
+    [[ -f "$tag" && ! -L "$tag" ]] || return 1
+
+    local signature
+    signature=$(LC_ALL=C dd bs=${#MOLE_CACHEDIR_TAG_SIGNATURE} count=1 < "$tag" 2> /dev/null || true)
+    [[ "$signature" == "$MOLE_CACHEDIR_TAG_SIGNATURE" ]]
+}
+
 mole_purge_quick_hint_target_names() {
     local target
     local excluded
@@ -122,6 +192,27 @@ mole_purge_quick_hint_target_names() {
     done
 }
 
+# Resolve a directory path to its canonical filesystem casing.
+# On case-insensitive macOS (APFS), ~/Code and ~/code point to the same
+# directory but with different display names.  This function returns the
+# real (on-disk) path so that string comparisons work correctly for dedup.
+#
+# Uses the external /bin/pwd rather than the bash builtin: bash's `pwd -P`
+# resolves symlink chains in $PWD but reuses the casing of the `cd`
+# argument instead of querying the filesystem, so on case-insensitive APFS
+# it returns ~/Workspace even when the on-disk directory is ~/workspace.
+# That breaks the string dedup in discover_project_dirs and a project
+# appears twice (#1416). /bin/pwd calls getcwd(3), which returns the real
+# on-disk name.
+mole_purge_resolve_path_case() {
+    local path="$1"
+    if [[ -d "$path" ]]; then
+        (cd "$path" 2> /dev/null && /bin/pwd -P) || printf '%s\n' "$path"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
 mole_purge_read_paths_config() {
     local config_file="${1:-$HOME/.config/mole/purge_paths}"
     [[ -f "$config_file" ]] || return 0
@@ -132,6 +223,7 @@ mole_purge_read_paths_config() {
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" || "$line" =~ ^# ]] && continue
         line="${line/#\~/$HOME}"
+        line=$(mole_purge_resolve_path_case "$line")
         printf '%s\n' "$line"
     done < "$config_file"
 }
