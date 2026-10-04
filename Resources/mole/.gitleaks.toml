@@ -1,0 +1,27 @@
+# Mole gitleaks configuration
+# Replaces grep-based secret scan in .github/workflows/test.yml
+# Uses gitleaks default ruleset (AWS / GitHub / Slack / private keys / etc).
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Mole-specific allowlist"
+
+# Test fixtures and mock binaries never hold real secrets.
+paths = [
+    '''tests/.*''',
+    '''.*\.bats$''',
+    # Bundle ID lists in app protection use "keychain*", "security*" etc. as
+    # wildcard patterns, not secrets.
+    '''lib/core/app_protection\.sh''',
+    '''lib/core/app_protection_data\.sh''',
+]
+
+# Mole talks about "password" / "Touch ID" in UI prompts and sudo helpers.
+# These are user-visible strings, not credentials.
+regexes = [
+    '''password( and| or| dialog| prompt| input|,)''',
+    '''Touch ID or password''',
+    '''_request_password''',
+]
