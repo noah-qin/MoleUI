@@ -1,26 +1,21 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
-
-    ORIGINAL_HOME="${HOME:-}"
-    export ORIGINAL_HOME
-
-    HOME="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-scripts-home.XXXXXX")"
-    export HOME
-
-    mkdir -p "$HOME"
+    mole_test_setup_home scripts-home
 }
 
 teardown_file() {
-    rm -rf "$HOME"
-    if [[ -n "${ORIGINAL_HOME:-}" ]]; then
-        export HOME="$ORIGINAL_HOME"
-    fi
+    mole_test_teardown_home
 }
 
 setup() {
+    # Safety: refuse to operate on a real home directory.
+    if [[ "$HOME" != "${BATS_TEST_DIRNAME}/tmp-"* ]]; then
+        printf 'FATAL: HOME is not a test temp dir: %s\n' "$HOME" >&2
+        return 1
+    fi
     export TERM="dumb"
     rm -rf "${HOME:?}"/*
     mkdir -p "$HOME"
@@ -29,8 +24,8 @@ setup() {
 @test "check.sh --help shows usage information" {
     run "$PROJECT_ROOT/scripts/check.sh" --help
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Usage"* ]]
-    [[ "$output" == *"--format"* ]]
+    [[ "$output" == *"Usage"* ]] || return 1
+    [[ "$output" == *"--format"* ]] || return 1
     [[ "$output" == *"--no-format"* ]]
 }
 
@@ -38,37 +33,280 @@ setup() {
     [ -f "$PROJECT_ROOT/scripts/check.sh" ]
     [ -x "$PROJECT_ROOT/scripts/check.sh" ]
 
-    run bash -c "grep -q 'Mole Check' '$PROJECT_ROOT/scripts/check.sh'"
-    [ "$status" -eq 0 ]
+    run /bin/bash -c "grep -q 'Mole Check' '$PROJECT_ROOT/scripts/check.sh'"
+	[ "$status" -eq 0 ]
+}
+
+@test "check workflow pins the shfmt version" {
+	local workflow="$PROJECT_ROOT/.github/workflows/check.yml"
+
+	run grep -F "go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1" "$workflow"
+	[ "$status" -eq 0 ] || return 1
+
+	run grep -E "brew install .*shfmt" "$workflow"
+	[ "$status" -ne 0 ] || return 1
+}
+
+@test "check workflow pins goimports to the project Go toolchain" {
+	run grep -F 'golang.org/x/tools/cmd/goimports@v0.49.0' \
+		"$PROJECT_ROOT/.github/workflows/check.yml"
+	[ "$status" -eq 0 ]
+	run grep -F 'golang.org/x/tools/cmd/goimports@latest' \
+		"$PROJECT_ROOT/.github/workflows/check.yml"
+	[ "$status" -ne 0 ]
+}
+
+@test "diagnostic placement check keeps the support-only script off public surfaces" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+eval "$(awk '/^check_diagnostic_placement\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$PROJECT_ROOT/scripts/check.sh")"
+
+clean="$HOME/public-clean.md"
+printf 'Run `mo status --json` and paste the output.\n' > "$clean"
+check_diagnostic_placement "$clean" || { echo "UNEXPECTED_CLEAN_FAIL"; exit 1; }
+
+leaked="$HOME/public-leaked.yml"
+printf 'intro\nrun curl -fsSL https://mole.fit/downloads/Mole-Diagnose.command | bash\n' > "$leaked"
+if check_diagnostic_placement "$clean" "$leaked"; then
+	echo "UNEXPECTED_LEAK_PASS"
+	exit 1
+fi
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"public-leaked.yml:2:"*"support-only diagnostic script on a public surface"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"public-clean.md"* ]] || { echo "$output"; return 1; }
+	[[ "$output" != *"UNEXPECTED"* ]]
 }
 
 @test "test.sh script exists and is valid" {
     [ -f "$PROJECT_ROOT/scripts/test.sh" ]
     [ -x "$PROJECT_ROOT/scripts/test.sh" ]
 
-    run bash -c "grep -q 'Mole Test Runner' '$PROJECT_ROOT/scripts/test.sh'"
+    run /bin/bash -c "grep -q 'Mole Test Runner' '$PROJECT_ROOT/scripts/test.sh'"
     [ "$status" -eq 0 ]
 }
 
 @test "test.sh includes test lint step" {
-    run bash -c "grep -q 'Test script lint' '$PROJECT_ROOT/scripts/test.sh'"
+    run /bin/bash -c "grep -q 'Test script lint' '$PROJECT_ROOT/scripts/test.sh'"
     [ "$status" -eq 0 ]
 }
 
+@test "destructive sink audit catches recursive rm variants and find delete" {
+    local audit="$PROJECT_ROOT/scripts/audit_destructive_sinks.py"
+    [ -x "$audit" ]
+
+    local safe_fixture="$HOME/destructive-safe.sh"
+    local unsafe_fixture="$HOME/destructive-unsafe.sh"
+    cat > "$safe_fixture" <<'EOF'
+rm -rf "$scratch" # SAFE: exact test scratch directory
+/bin/rm -r -f "$scratch" # SAFE: exact test scratch directory
+find "$scratch" -delete # SAFE: exact test scratch directory
+echo "rm -rf appears only in guidance"
+printf '%s\n' 'find example -delete'
+EOF
+    cat > "$unsafe_fixture" <<'EOF'
+command rm -fr "$target"
+sudo -n /bin/rm -r -f "$target"
+find "$target" -depth -delete
+echo "starting"; rm -rf "$target"
+printf 'starting' && find "$target" -delete
+rm "$target" -Rf
+rm --recursive --force "$target"
+find "$target" -delete; echo done
+printf '%s\0' "$target" | xargs -0 rm -rf
+echo "$(rm -rf "$target")"
+command r\m -rf "$target"
+# A comment ending in a backslash does not continue onto the next shell line. \
+rm -rf "$target"
+EOF
+
+    run python3 "$audit" "$safe_fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"destructive-sink-audit-ok"* ]] || return 1
+
+    run python3 "$audit" "$unsafe_fixture"
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"$unsafe_fixture:1:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:2:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:3:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:4:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:5:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:6:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:7:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:8:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:9:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:10:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:11:"* ]] || return 1
+    [[ "$output" == *"$unsafe_fixture:13:"* ]] || return 1
+    [[ "$output" == *"# SAFE:"* ]] || return 1
+}
+
+@test "CI and local checks share the destructive sink audit" {
+    run grep -F 'audit_destructive_sinks.py' "$PROJECT_ROOT/scripts/check.sh"
+    [ "$status" -eq 0 ]
+    run grep -F 'scripts/audit_destructive_sinks.py' "$PROJECT_ROOT/.github/workflows/test.yml"
+    [ "$status" -eq 0 ]
+}
+
+@test "bats assertion audit catches negated assertions that cannot fail" {
+    local audit="$PROJECT_ROOT/scripts/audit_bats_assertions.py"
+    local live_fixture="$HOME/negation-live.bats"
+    local vacuous_fixture="$HOME/negation-vacuous.bats"
+    # Bats would read a literal test header here as a test of this file.
+    sed 's/^TEST /@test /' > "$live_fixture" <<'BATS'
+TEST "negations that can still fail" {
+    ! grep -q gone "$trace" || return 1
+    run /bin/bash -c "
+        source lib.sh
+        ! is_protected /tmp/x
+    "
+    cat > "$HOME/mock" <<'EOF'
+! grep -q data "$file"
+echo done
+EOF
+    run env HOME="$HOME" /bin/bash --noprofile --norc <<'EOF'
+stub() {
+    ! true
+    :
+}
+! grep -q gone "$trace" || exit 1
+! grep -q gone "$trace"
+EOF
+    ! grep -q gone "$trace"
+}
+BATS
+    sed 's/^TEST /@test /' > "$vacuous_fixture" <<'BATS'
+TEST "negations that never fail" {
+    ! grep -q gone "$trace"
+    run env HOME="$HOME" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+! grep -q gone "$trace"
+[[ -f "$trace" ]]
+EOF
+    [ "$status" -eq 0 ]
+}
+BATS
+
+    run python3 "$audit" "$live_fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"bats-assertion-audit-ok"* ]] || return 1
+
+    run python3 "$audit" "$vacuous_fixture"
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"$vacuous_fixture:2:"* ]] || return 1
+    [[ "$output" == *"$vacuous_fixture:5:"* ]] || return 1
+    [[ "$(grep -c "bare '! cmd'" <<< "$output")" -eq 2 ]] || { echo "$output"; return 1; }
+}
+
 @test "Makefile has build target for Go binaries" {
-    run bash -c "grep -Eq '(^|[[:space:]])(go|\\$\\(GO\\))[[:space:]]+build' '$PROJECT_ROOT/Makefile'"
+    run /bin/bash -c "grep -Eq '(^|[[:space:]])(go|\\$\\(GO\\))[[:space:]]+build' '$PROJECT_ROOT/Makefile'"
+    [ "$status" -eq 0 ]
+}
+
+@test "release builds disable cgo and check minimum macOS version" {
+    run /bin/bash -c "grep -q '^RELEASE_GO_ENV := CGO_ENABLED=0$' '$PROJECT_ROOT/Makefile'"
+    [ "$status" -eq 0 ]
+    run /bin/bash -c "grep -q 'scripts/check_release_minos.sh' '$PROJECT_ROOT/.github/workflows/release.yml'"
+    [ "$status" -eq 0 ]
+    [ -x "$PROJECT_ROOT/scripts/check_release_minos.sh" ]
+    run grep -F 'MAX_RELEASE_MINOS:-12.0' "$PROJECT_ROOT/scripts/check_release_minos.sh"
+    [ "$status" -eq 0 ]
+}
+
+@test "contributor requirements match the release and Go toolchains" {
+    local go_version
+    go_version=$(awk '$1 == "go" { print $2; exit }' "$PROJECT_ROOT/go.mod")
+    local go_major_minor="${go_version%.*}"
+    local release_minos
+    release_minos=$(sed -n 's/.*MAX_RELEASE_MINOS:-\([^}]*\).*/\1/p' \
+        "$PROJECT_ROOT/scripts/check_release_minos.sh" | head -1)
+    local macos_major="${release_minos%%.*}"
+
+    [[ "$go_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "$release_minos" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+    for requirements_doc in "$PROJECT_ROOT/README.md" "$PROJECT_ROOT/CONTRIBUTING.md"; do
+        run grep -F "macOS $macos_major or newer" "$requirements_doc"
+        [ "$status" -eq 0 ]
+    done
+    run grep -F "Go $go_major_minor+" "$PROJECT_ROOT/CONTRIBUTING.md"
+    [ "$status" -eq 0 ]
+}
+
+@test "release minos gate accepts 12.0 and rejects a newer deployment target" {
+    local fake_bin="$HOME/minos-bin"
+    local fake_binary="$HOME/analyze-darwin-arm64"
+    mkdir -p "$fake_bin"
+    touch "$fake_binary"
+    cat > "$fake_bin/otool" <<'EOF'
+#!/bin/bash
+printf '      cmd LC_BUILD_VERSION\n'
+printf '    minos %s\n' "$FAKE_MINOS"
+EOF
+    chmod +x "$fake_bin/otool"
+
+    run env PATH="$fake_bin:$PATH" FAKE_MINOS=12.0 \
+        "$PROJECT_ROOT/scripts/check_release_minos.sh" "$fake_binary"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"minos 12.0 <= 12.0"* ]] || return 1
+
+    run env PATH="$fake_bin:$PATH" FAKE_MINOS=12.1 \
+        "$PROJECT_ROOT/scripts/check_release_minos.sh" "$fake_binary"
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"minos 12.1 exceeds allowed 12.0"* ]] || return 1
+}
+
+@test "release workflow rejects a tag that differs from the source version" {
+    local workflow="$PROJECT_ROOT/.github/workflows/release.yml"
+
+    run grep -F 'name: Verify release tag matches source version' "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F "SOURCE_VERSION=\$(sed -n" "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F "EXPECTED_TAG=\"V\${SOURCE_VERSION}\"" "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F "\"\$RELEASE_TAG\" != \"\$EXPECTED_TAG\"" "$workflow"
+    [ "$status" -eq 0 ]
+}
+
+@test "release workflow keeps the Homebrew Core PR open (#1209)" {
+    local workflow="$PROJECT_ROOT/.github/workflows/release.yml"
+
+    run grep -F "Have you followed the [guidelines for contributing]" "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F "pulls?state=all&head=tw93:" "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F 'PR_STATE" != "open"' "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F 'core_status=published' "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F 'core_status=pr-open' "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F 'url_matches != 1 || sha_matches != 1' "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F 'already exists; refusing to overwrite it.' "$workflow"
+    [ "$status" -eq 0 ]
+    run grep -F "git push \"--force-with-lease=refs/heads/\${BRANCH}:\" origin \"\$BRANCH\"" "$workflow"
+    [ "$status" -eq 0 ]
+
+    run awk '
+        /name: Update Homebrew formula \(Official Core\)/ { in_step = 1 }
+        in_step && /continue-on-error:/ { found = 1 }
+        in_step && /name: Verify formula updates/ { exit found ? 1 : 0 }
+        END { if (!in_step) exit 1 }
+    ' "$workflow"
     [ "$status" -eq 0 ]
 }
 
 @test "setup-quick-launchers.sh has detect_mo function" {
-    run bash -c "grep -q 'detect_mo()' '$PROJECT_ROOT/scripts/setup-quick-launchers.sh'"
+    run /bin/bash -c "grep -q 'detect_mo()' '$PROJECT_ROOT/scripts/setup-quick-launchers.sh'"
     [ "$status" -eq 0 ]
 }
 
 @test "setup-quick-launchers.sh has Raycast script generation" {
-    run bash -c "grep -q 'create_raycast_commands' '$PROJECT_ROOT/scripts/setup-quick-launchers.sh'"
+    run /bin/bash -c "grep -q 'create_raycast_commands' '$PROJECT_ROOT/scripts/setup-quick-launchers.sh'"
     [ "$status" -eq 0 ]
-    run bash -c "grep -q 'write_raycast_script' '$PROJECT_ROOT/scripts/setup-quick-launchers.sh'"
+    run /bin/bash -c "grep -q 'write_raycast_script' '$PROJECT_ROOT/scripts/setup-quick-launchers.sh'"
     [ "$status" -eq 0 ]
 }
 
@@ -84,8 +322,8 @@ EOF
     run env HOME="$HOME" TERM="dumb" PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         "$PROJECT_ROOT/scripts/setup-quick-launchers.sh"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Raycast: Mole Clean | Alfred keyword: clean"* ]]
-    [[ "$output" == *"Raycast: Mole Status | Alfred keyword: status"* ]]
+    [[ "$output" == *"Raycast: Mole Clean | Alfred keyword: clean"* ]] || return 1
+    [[ "$output" == *"Raycast: Mole Status | Alfred keyword: status"* ]] || return 1
 
     local raycast_dir="$HOME/Library/Application Support/Raycast/script-commands"
     [ -d "$raycast_dir" ]
@@ -126,8 +364,76 @@ EOF
 }
 
 @test "install.sh supports dev branch installs" {
-    run bash -c "grep -q 'refs/heads/dev.tar.gz' '$PROJECT_ROOT/install.sh'"
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mole_source_installer
+[[ "$(source_archive_url dev "")" == "https://github.com/tw93/mole/archive/refs/heads/dev.tar.gz" ]]
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    run /bin/bash -c "grep -q 'MOLE_VERSION=\"dev\"' '$PROJECT_ROOT/install.sh'"
     [ "$status" -eq 0 ]
-    run bash -c "grep -q 'MOLE_VERSION=\"dev\"' '$PROJECT_ROOT/install.sh'"
+}
+
+@test "release workflow keeps Homebrew distribution on official core only" {
+    run grep -q 'update-homebrew-core:' "$PROJECT_ROOT/.github/workflows/release.yml"
     [ "$status" -eq 0 ]
+
+    run grep -Eq 'update-personal-tap:|tw93/homebrew-tap|PAT_TOKEN' "$PROJECT_ROOT/.github/workflows/release.yml"
+    [ "$status" -ne 0 ]
+
+    [ ! -e "$PROJECT_ROOT/scripts/update_homebrew_tap_formula.sh" ]
+
+    run grep -Eq 'Homebrew tap|personal tap' "$PROJECT_ROOT/.claude/skills/release-notes/SKILL.md"
+    [ "$status" -ne 0 ]
+    run grep -q 'Homebrew Core PR is workflow-driven' "$PROJECT_ROOT/.claude/skills/release-notes/SKILL.md"
+    [ "$status" -eq 0 ]
+}
+
+@test "no shell function shares another's body under a different name" {
+    # This gate also lives in check.sh, but CI runs scripts/test.sh and never
+    # check.sh, so without this case it could not block a pull request. The
+    # class it catches is invisible to grep: the copies that matter have
+    # already had their variables renamed, which is why review reads them as
+    # separate helpers. Run the script with --list to inspect every group.
+    run python3 "$PROJECT_ROOT/scripts/audit_function_duplication.py"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "test runner only passes parallel flags for multiple jobs" {
+    local options_script="$HOME/bats-options.sh"
+    # Exercise the actual option-selection block without starting another
+    # full test runner. Both anchors must exist exactly once.
+    python3 - "$PROJECT_ROOT/scripts/test.sh" "$options_script" <<'PYTHON'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+start = '\n    bats_help="$(bats --help 2>&1 || true)"'
+end = '\n    if [[ "${MOLE_TEST_TIMING:-0}" == "1" ]]; then'
+assert source.count(start) == source.count(end) == 1
+Path(sys.argv[2]).write_text(start + source.split(start, 1)[1].split(end, 1)[0])
+PYTHON
+    local jobs
+    for jobs in 1 2; do
+        run env MOLE_TEST_JOBS="$jobs" OPTIONS_SCRIPT="$options_script" \
+            /bin/bash --noprofile --norc <<'SCRIPT'
+set -euo pipefail
+bats() { printf '%s\n' '--jobs --formatter'; }
+parallel() { :; }
+sysctl() { echo 4; }
+source "$OPTIONS_SCRIPT"
+printf 'COUNT=%s\n' "${#bats_opts[@]}"
+if [[ ${#bats_opts[@]} -gt 0 ]]; then
+    printf 'ARG=%s\n' "${bats_opts[@]}"
+fi
+SCRIPT
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        if [[ "$jobs" == 1 ]]; then
+            [[ "$output" == 'COUNT=0' ]] || { echo "$output"; return 1; }
+        else
+            [[ "$output" == $'COUNT=3\nARG=--jobs\nARG=2\nARG=--no-parallelize-within-files' ]] || { echo "$output"; return 1; }
+        fi
+    done
 }

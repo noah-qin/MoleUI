@@ -8,6 +8,9 @@ brew install shfmt shellcheck bats-core golangci-lint
 
 # Install goimports for better Go formatting
 go install golang.org/x/tools/cmd/goimports@latest
+
+# Install pre-commit hook (runs format/lint checks on every commit)
+git config core.hooksPath .githooks
 ```
 
 ## Development
@@ -127,10 +130,10 @@ Format: `[MODULE_NAME] message` output to stderr.
 
 ## Requirements
 
-- macOS 10.14 or newer, works on Intel and Apple Silicon
+- macOS 12 or newer, works on Intel and Apple Silicon
 - Default macOS Bash 3.2+ plus administrator privileges for cleanup tasks
 - Install Command Line Tools with `xcode-select --install` for curl, tar, and related utilities
-- Go 1.24+ is required to build the `mo status` or `mo analyze` TUI binaries locally.
+- Go 1.26+ is required to build the `mo status` or `mo analyze` TUI binaries locally.
 
 ## Go Components
 
@@ -138,13 +141,13 @@ Format: `[MODULE_NAME] message` output to stderr.
 
 **Code organization:**
 
-- Each module split into focused files by responsibility
-- `cmd/analyze/` - Disk analyzer with 7 files under 500 lines each
-- `cmd/status/` - System monitor with metrics split into 11 domain files
+- Each module is split into focused files by responsibility.
+- `cmd/analyze/` owns disk traversal, caching, deletion, navigation, and rendering.
+- `cmd/status/` keeps collection, automation output, preferences, and rendering separate.
 
 **Development workflow:**
 
-- Format code with `gofmt -w ./cmd/...`
+- Format code with `./scripts/check.sh --format`
 - Run `go vet ./cmd/...` to check for issues
 - Build with `go build ./...` to verify all packages compile
 
@@ -179,3 +182,9 @@ For releases, GitHub Actions builds architecture-specific binaries automatically
 5. Open PR targeting `main`
 
 CI will verify formatting, linting, and tests.
+
+## Licensing
+
+Mole is GPL-3.0, and that is the licence your contribution carries. There is no CLA. You keep your copyright and I get only what the licence gives me, which means I cannot put your code under a different one.
+
+I also sell a closed-source Mac app at [mole.fit](https://mole.fit). It is a separate codebase rather than a build of this one, and neither program calls the other. What the two share is what anyone can observe about macOS: where a cache lives, what an app leaves behind. If you would rather not contribute alongside a paid product, that is a fair call, and I would rather you made it now than later.

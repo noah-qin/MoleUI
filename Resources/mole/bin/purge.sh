@@ -5,6 +5,13 @@
 
 set -euo pipefail
 
+# User state and installed tools must never run with inherited root privileges.
+# Individual maintenance operations request administrator access themselves.
+if [[ "$EUID" -eq 0 ]]; then
+    printf '%s\n' 'Run Mole without sudo; it requests administrator access when needed.' >&2
+    exit 1
+fi
+
 # Fix locale issues (avoid Perl warnings on non-English systems)
 export LC_ALL=C
 export LANG=C
@@ -13,15 +20,30 @@ export LANG=C
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/core/common.sh"
 
-# Set up cleanup trap for temporary files
-trap cleanup_temp_files EXIT INT TERM
+# Restores cursor and clears temp files even when set -e aborts (#915).
+cleanup() {
+    show_cursor 2> /dev/null || true
+    cleanup_temp_files
+}
+trap cleanup EXIT
+trap 'trap - EXIT; cleanup; exit 130' INT TERM
 source "$SCRIPT_DIR/../lib/core/log.sh"
 source "$SCRIPT_DIR/../lib/clean/project.sh"
+
+# Purge ends at safe_remove just like clean, so initialize the invoking user's
+# whitelist before project discovery or the interactive selection begins.
+load_mole_whitelist
 
 # Configuration
 CURRENT_SECTION=""
 
-# Section management
+# IMPORTANT: This file overrides start_section / end_section / note_activity
+# from lib/core/base.sh by virtue of being sourced after it. The purge variant
+# uses a blue ━━━ box header, has no fallback "Nothing to ..." message, and
+# writes every note_activity call straight to EXPORT_LIST_FILE (purge always
+# wants the export list, not just under DRY_RUN). See the cross-reference in
+# lib/core/base.sh and the clean variant in bin/clean.sh before changing any
+# of these three.
 start_section() {
     local section_name="$1"
     CURRENT_SECTION="$section_name"
@@ -33,11 +55,57 @@ end_section() {
     CURRENT_SECTION=""
 }
 
-# Note activity for export list
 note_activity() {
     if [[ -n "$CURRENT_SECTION" ]]; then
         printf '%s\n' "$CURRENT_SECTION" >> "$EXPORT_LIST_FILE"
     fi
+}
+
+# Keep the most specific tail of a long purge path visible on the live scan line.
+compact_purge_scan_path() {
+    local path="$1"
+    local max_path_len="${2:-0}"
+
+    if ! [[ "$max_path_len" =~ ^[0-9]+$ ]] || [[ "$max_path_len" -lt 4 ]]; then
+        max_path_len=4
+    fi
+
+    if [[ ${#path} -le $max_path_len ]]; then
+        echo "$path"
+        return
+    fi
+
+    local suffix_len=$((max_path_len - 3))
+    local suffix="${path: -$suffix_len}"
+    local path_tail=""
+    local remainder="$path"
+
+    while [[ "$remainder" == */* ]]; do
+        local segment="/${remainder##*/}"
+        remainder="${remainder%/*}"
+
+        if [[ -z "$path_tail" ]]; then
+            if [[ ${#segment} -le $suffix_len ]]; then
+                path_tail="$segment"
+            else
+                break
+            fi
+            continue
+        fi
+
+        if [[ $((${#segment} + ${#path_tail})) -le $suffix_len ]]; then
+            path_tail="${segment}${path_tail}"
+        else
+            break
+        fi
+    done
+
+    if [[ -n "$path_tail" ]]; then
+        echo "...${path_tail}"
+        return
+    fi
+
+    echo "...$suffix"
 }
 
 # Main purge function
@@ -115,7 +183,7 @@ perform_purge() {
 
         # Start background monitor: writes directly to /dev/tty to avoid stdout state issues
         (
-            local spinner_chars="|/-\\"
+            mo_load_spinner_frames
             local spinner_idx=0
             local last_path=""
             # Use parent-captured width; never refresh inside the loop (avoids unreliable tput in bg)
@@ -127,29 +195,23 @@ perform_purge() {
             # Set up trap to exit cleanly (erase the spinner line via /dev/tty)
             trap 'printf "\r\033[2K" >/dev/tty 2>/dev/null; exit 0' INT TERM
 
-            # Truncate path to guaranteed fit
-            truncate_path() {
-                local path="$1"
-                if [[ ${#path} -le $max_path_len ]]; then
-                    echo "$path"
-                    return
-                fi
-                local side_len=$(((max_path_len - 3) / 2))
-                echo "${path:0:$side_len}...${path: -$side_len}"
-            }
-
+            local _parent_pid=$$
             while [[ -f "$stats_dir/purge_scanning" ]]; do
+                # Exit if parent process died (prevents orphaned spinner)
+                if ! kill -0 "$_parent_pid" 2> /dev/null; then
+                    break
+                fi
                 local current_path
                 current_path=$(cat "$stats_dir/purge_scanning" 2> /dev/null || echo "")
 
                 if [[ -n "$current_path" ]]; then
                     local display_path="${current_path/#$HOME/~}"
-                    display_path=$(truncate_path "$display_path")
+                    display_path=$(compact_purge_scan_path "$display_path" "$max_path_len")
                     last_path="$display_path"
                 fi
 
-                local spin_char="${spinner_chars:$spinner_idx:1}"
-                spinner_idx=$(((spinner_idx + 1) % ${#spinner_chars}))
+                local spin_char="${MO_SPINNER_FRAMES[$spinner_idx]}"
+                spinner_idx=$(((spinner_idx + 1) % ${#MO_SPINNER_FRAMES[@]}))
 
                 # Write directly to /dev/tty: \033[2K clears entire current line, \r goes to start
                 if [[ -n "$last_path" ]]; then
@@ -173,19 +235,21 @@ perform_purge() {
     fi
 
     clean_project_artifacts
-    local exit_code=$?
+    local purge_outcome="${PURGE_RUN_OUTCOME:-scan_failed}"
 
     # Clean up
     trap - INT TERM
     cleanup_monitor
 
-    # Exit codes:
-    # 0 = success, show summary
-    # 1 = user cancelled
-    # 2 = nothing to clean
-    if [[ $exit_code -ne 0 ]]; then
-        return 0
-    fi
+    case "$purge_outcome" in
+        no_candidates | cancelled) return 0 ;;
+        scan_failed) return 1 ;;
+        completed | incomplete) ;;
+        *)
+            log_error "Unknown purge outcome: $purge_outcome"
+            return 1
+            ;;
+    esac
 
     # Final summary (matching clean.sh format)
     echo ""
@@ -208,21 +272,31 @@ perform_purge() {
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
         summary_heading="Dry run complete - no changes made"
     fi
+    if [[ "$purge_outcome" == "incomplete" ]]; then
+        summary_heading="Purge incomplete"
+        [[ "${MOLE_DRY_RUN:-0}" == "1" ]] && summary_heading="Dry run incomplete - no changes made"
+    fi
 
-    if [[ $total_size_cleaned -gt 0 ]]; then
+    if [[ $total_items_cleaned -gt 0 ]]; then
         local freed_size_human
         freed_size_human=$(bytes_to_human_kb "$total_size_cleaned")
 
-        local summary_line="Space freed: ${GREEN}${freed_size_human}${NC}"
+        local summary_line="Estimated space freed: ${GREEN}${freed_size_human}${NC}"
         if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
-            summary_line="Would free: ${GREEN}${freed_size_human}${NC}"
+            summary_line="Would free approximately: ${GREEN}${freed_size_human}${NC}"
+        fi
+        if [[ ${PURGE_UNKNOWN_SIZE_COUNT:-0} -gt 0 ]]; then
+            summary_line+=" + ${PURGE_UNKNOWN_SIZE_COUNT} unmeasured"
         fi
         [[ $total_items_cleaned -gt 0 ]] && summary_line+=" | Items: $total_items_cleaned"
         summary_line+=" | Free: $(get_free_space)"
         summary_details+=("$summary_line")
     else
-        summary_details+=("No old project artifacts to clean.")
+        summary_details+=("No artifacts were removed.")
         summary_details+=("Free space: $(get_free_space)")
+    fi
+    if [[ "$purge_outcome" == "incomplete" ]]; then
+        summary_details+=("Some artifacts were skipped or could not be processed.")
     fi
 
     # Log session end
@@ -230,6 +304,7 @@ perform_purge() {
 
     print_summary_block "$summary_heading" "${summary_details[@]}"
     printf '\n'
+    [[ "$purge_outcome" == "completed" ]]
 }
 
 # Show help message
@@ -241,6 +316,8 @@ show_help() {
     echo -e "${YELLOW}Options:${NC}"
     echo "  --paths         Edit custom scan directories"
     echo "  --dry-run       Preview purge actions without making changes"
+    echo "  --include-empty Show zero-size project artifact directories"
+    echo "  --yes           Confirm unattended cleanup of eligible artifacts"
     echo "  --debug         Enable debug logging"
     echo "  --help          Show this help message"
     echo ""
@@ -252,9 +329,6 @@ show_help() {
 
 # Main entry point
 main() {
-    # Set up signal handling
-    trap 'show_cursor; exit 130' INT TERM
-
     # Parse arguments
     for arg in "$@"; do
         case "$arg" in
@@ -273,9 +347,15 @@ main() {
             "--dry-run" | "-n")
                 export MOLE_DRY_RUN=1
                 ;;
+            "--yes")
+                export MOLE_PURGE_YES=1
+                ;;
+            "--include-empty")
+                export MOLE_PURGE_INCLUDE_EMPTY=1
+                ;;
             *)
-                echo "Unknown option: $arg"
-                echo "Use 'mo purge --help' for usage information"
+                echo "Unknown option: $arg" >&2
+                echo "Use 'mo purge --help' for usage information" >&2
                 exit 1
                 ;;
         esac
@@ -288,7 +368,14 @@ main() {
     fi
     hide_cursor
     perform_purge
-    show_cursor
 }
+
+if [[ "${MOLE_SKIP_MAIN:-0}" == "1" ]]; then
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 0
+    else
+        exit 0
+    fi
+fi
 
 main "$@"

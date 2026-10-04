@@ -4,11 +4,20 @@
 
 set -euo pipefail
 
+if [[ -n "${MOLE_HEALTH_JSON_LOADED:-}" ]]; then
+    return 0
+fi
+readonly MOLE_HEALTH_JSON_LOADED=1
+
 # Ensure dependencies are loaded (only if running standalone)
 if [[ -z "${MOLE_FILE_OPS_LOADED:-}" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
     source "$SCRIPT_DIR/lib/core/file_ops.sh"
 fi
+
+_MOLE_HEALTH_JSON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly _MOLE_HEALTH_JSON_DIR
+source "$_MOLE_HEALTH_JSON_DIR/../optimize/catalog.sh"
 
 # Get memory info in GB
 get_memory_info() {
@@ -22,7 +31,12 @@ get_memory_info() {
     # Used memory from vm_stat
     local vm_output active wired compressed page_size
     vm_output=$(vm_stat 2> /dev/null || echo "")
-    page_size=4096
+    # vm_stat reports page counts in units of its own page size, which is
+    # 16384 on Apple Silicon, not 4096. Read the size it declares in its
+    # header so used_bytes is correct; fall back to sysctl, then 4096.
+    page_size=$(printf '%s\n' "$vm_output" | LC_ALL=C sed -n 's/.*page size of \([0-9][0-9]*\) bytes.*/\1/p' | head -1)
+    [[ "$page_size" =~ ^[0-9]+$ ]] || page_size=$(sysctl -n hw.pagesize 2> /dev/null)
+    [[ "$page_size" =~ ^[0-9]+$ ]] || page_size=4096
 
     active=$(echo "$vm_output" | LC_ALL=C awk '/Pages active:/ {print $NF}' | tr -d '.\n' 2> /dev/null)
     wired=$(echo "$vm_output" | LC_ALL=C awk '/Pages wired down:/ {print $NF}' | tr -d '.\n' 2> /dev/null)
@@ -120,42 +134,17 @@ generate_health_json() {
   "optimizations": [
 EOF
 
-    # Collect all optimization items
-    local -a items=()
-
-    # Core optimizations (safe and valuable)
-    items+=('system_maintenance|DNS & Spotlight Check|Refresh DNS cache & verify Spotlight status|true')
-    items+=('cache_refresh|Finder Cache Refresh|Refresh QuickLook thumbnails & icon services cache|true')
-    items+=('saved_state_cleanup|App State Cleanup|Remove old saved application states (30+ days)|true')
-    items+=('fix_broken_configs|Broken Config Repair|Fix corrupted preferences files|true')
-    items+=('network_optimization|Network Cache Refresh|Optimize DNS cache & restart mDNSResponder|true')
-
-    # Advanced optimizations (high value, auto-run with safety checks)
-    items+=('sqlite_vacuum|Database Optimization|Compress SQLite databases for Mail, Safari & Messages (skips if apps are running)|true')
-    items+=('launch_services_rebuild|LaunchServices Repair|Repair "Open with" menu & file associations|true')
-    items+=('font_cache_rebuild|Font Cache Rebuild|Rebuild font database to fix rendering issues (skips if browsers are running)|true')
-    items+=('dock_refresh|Dock Refresh|Fix broken icons and visual glitches in the Dock|true')
-
-    # System performance optimizations (new)
-    items+=('memory_pressure_relief|Memory Optimization|Release inactive memory to improve system responsiveness|true')
-    items+=('network_stack_optimize|Network Stack Refresh|Flush routing table and ARP cache to resolve network issues|true')
-    items+=('disk_permissions_repair|Permission Repair|Fix user directory permission issues|true')
-    items+=('bluetooth_reset|Bluetooth Refresh|Restart Bluetooth module to fix connectivity (skips if in use)|true')
-    items+=('spotlight_index_optimize|Spotlight Optimization|Rebuild index if search is slow (smart detection)|true')
-
-    # Removed high-risk optimizations:
-    # - startup_items_cleanup: Risk of deleting legitimate app helpers
-    # - system_services_refresh: Risk of data loss when killing system services
-    # - dyld_cache_update: Low benefit, time-consuming, auto-managed by macOS
-
-    # Output items as JSON
     local first=true
-    for item in "${items[@]}"; do
-        IFS='|' read -r action name desc safe <<< "$item"
+    local index action health_name desc safe
+    for ((index = 0; index < ${#MOLE_OPTIMIZE_ACTIONS[@]}; index++)); do
+        action=${MOLE_OPTIMIZE_ACTIONS[$index]}
+        health_name=${MOLE_OPTIMIZE_HEALTH_NAMES[$index]}
+        desc=${MOLE_OPTIMIZE_DESCRIPTIONS[$index]}
+        safe=${MOLE_OPTIMIZE_SAFE_VALUES[$index]}
 
         # Escape strings
         action=$(json_escape "$action")
-        name=$(json_escape "$name")
+        health_name=$(json_escape "$health_name")
         desc=$(json_escape "$desc")
 
         [[ "$first" == "true" ]] && first=false || echo ","
@@ -163,7 +152,7 @@ EOF
         cat << EOF
     {
       "category": "system",
-      "name": "$name",
+      "name": "$health_name",
       "description": "$desc",
       "action": "$action",
       "safe": $safe
