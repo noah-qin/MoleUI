@@ -6,25 +6,39 @@ on:
   pull_request:
     branches: [main, dev]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     name: Unit & Integration Tests
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install tools
-        run: brew install bats-core shellcheck
+        run: brew install bats-core shellcheck coreutils parallel
 
       - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.24.6"
+          go-version-file: go.mod
 
       - name: Run test script
         env:
           MOLE_PERF_BYTES_TO_HUMAN_LIMIT_MS: "6000"
           MOLE_PERF_GET_FILE_SIZE_LIMIT_MS: "3000"
+          MOLE_PERF_NORMALIZE_PATHS_LIMIT_MS: "10000"
+          MOLE_TEST_JOBS: "6"
+          # Emits a "Slowest test files" table at the end of the run. Parallel
+          # TAP output cannot be attributed to a file, so without this a single
+          # slow file that sets the whole job's wall clock stays invisible.
+          MOLE_TEST_REPORT_DIR: ${{ runner.temp }}/bats-report
           BATS_FORMATTER: tap
           LANG: en_US.UTF-8
           LC_ALL: en_US.UTF-8
@@ -32,34 +46,68 @@ jobs:
 
   compatibility:
     name: macOS
+    # Hosted runtime coverage is macOS 15 and 26, not macOS 14. macOS 26 is
+    # pinned so it stays a distinct lane after macos-latest, which the full
+    # test job uses, moves on. Release builds separately enforce an
+    # LC_BUILD_VERSION minimum of macOS 12 in check_release_minos.sh.
     strategy:
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Test on ${{ matrix.os }}
+      - name: Install bats
+        run: brew install bats-core coreutils
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Smoke load on ${{ matrix.os }}
         run: |
           echo "Testing on ${{ matrix.os }}..."
           bash -n mole
           source lib/core/common.sh
           echo "✓ Successfully loaded on ${{ matrix.os }}"
 
+      - name: Run core bats subset
+        env:
+          MOLE_TEST_NO_AUTH: "1"
+          MOLE_PERF_NORMALIZE_PATHS_LIMIT_MS: "10000"
+          BATS_FORMATTER: tap
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+        # clean_app_caches.bats is here because it is the suite that reads
+        # system tool output whose format varies by macOS version, which the
+        # full run on macos-latest cannot see. tw93/Mole#1512 was reported on
+        # macOS 15, fixed, then silently regressed for eight days with CI green
+        # the whole time, because that file was not in this subset. It adds
+        # about 16s to a job that runs in 90s under a 30 minute budget.
+        run: |
+          bats tests/core_safe_functions.bats \
+               tests/core_common.bats \
+               tests/core_timeout.bats \
+               tests/regression.bats \
+               tests/cli.bats \
+               tests/clean_app_caches.bats
+
   security:
     name: Security Checks
     runs-on: macos-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: brew install bats-core coreutils
 
       - name: Check for unsafe rm usage
-        run: |
-          echo "Checking for unsafe rm patterns..."
-          if grep -r "rm -rf" --include="*.sh" lib/ | grep -v "safe_remove\|validate_path\|# "; then
-            echo "✗ Unsafe rm -rf usage found"
-            exit 1
-          fi
-          echo "✓ No unsafe rm usage found"
+        run: python3 scripts/audit_destructive_sinks.py
 
       - name: Verify app protection
         run: |
@@ -74,15 +122,16 @@ jobs:
           fi
           '
 
-      - name: Check for secrets
-        run: |
-          echo "Checking for hardcoded secrets..."
-          matches=$(grep -r "password\|secret\|api_key" --include="*.sh" . \
-            | grep -v "# \|test" \
-            | grep -v -E "lib/core/sudo\.sh|lib/core/app_protection\.sh|lib/clean/user\.sh|lib/clean/brew\.sh|bin/optimize\.sh|lib/clean/apps\.sh|lib/uninstall/batch\.sh" || true)
-          if [[ -n "$matches" ]]; then
-            echo "$matches"
-            echo "✗ Potential secrets found"
-            exit 1
-          fi
-          echo "✓ No secrets found"
+      - name: Scan for secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+      - name: Run high-risk path regression tests
+        env:
+          MOLE_TEST_NO_AUTH: "1"
+          BATS_FORMATTER: tap
+          LANG: en_US.UTF-8
+          LC_ALL: en_US.UTF-8
+        run: bats tests/core_safe_functions.bats tests/purge.bats tests/installer.bats

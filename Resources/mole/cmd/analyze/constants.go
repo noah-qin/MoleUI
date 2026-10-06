@@ -1,14 +1,20 @@
+//go:build darwin
+
 package main
 
 import "time"
 
 const (
-	maxEntries             = 30
-	maxLargeFiles          = 20
-	barWidth               = 24
+	maxEntries    = 30
+	maxLargeFiles = 20
+	barWidth      = 24
+	// Below this many columns a scanned path is too clipped to tell anything
+	// apart, so it moves to its own row instead of sharing the status line.
+	scanPathInlineMinWidth = 24
 	spotlightMinFileSize   = 100 << 20
 	largeFileWarmupMinSize = 1 << 20
 	defaultViewport        = 12
+	analyzerCacheTTL       = 7 * 24 * time.Hour
 	overviewCacheTTL       = 7 * 24 * time.Hour
 	overviewCacheFile      = "overview_sizes.json"
 	duTimeout              = 30 * time.Second
@@ -16,16 +22,55 @@ const (
 	maxConcurrentOverview  = 8
 	batchUpdateSize        = 100
 	cacheModTimeGrace      = 30 * time.Minute
-	cacheReuseWindow       = 24 * time.Hour
 	staleCacheTTL          = 3 * 24 * time.Hour
 
-	// Worker pool limits.
-	minWorkers         = 16
-	maxWorkers         = 64
-	cpuMultiplier      = 4
-	maxDirWorkers      = 32
+	// Analyzer cache admission and eviction budget. A subtree is only worth a
+	// cache file when rescanning it is actually expensive: on a dev machine's
+	// 157k-entry cache the MEDIAN entry described a directory holding one file
+	// and 98% held fewer than 100, so nearly every file spent a 4KB APFS block
+	// plus an inode memoizing what a single readdir returns. Unbounded and
+	// admission-free, that reached 1.88M files / 7.82GB for one user. The
+	// thresholds keep the ~1.5% of entries that carry the reuse value; the
+	// count/byte caps are the backstop for trees that clear them anyway.
+	analyzerCacheDirName    = "analyzer"
+	subdirCacheMinFiles     = 100
+	subdirCacheMinSize      = 10 << 20
+	analyzerCacheMaxEntries = 5000
+	analyzerCacheMaxBytes   = 50 << 20
+	cacheDirReadBatch       = 512
+	legacySweepWorkers      = 4
+	staleTempFileTTL        = time.Hour
+
+	// Overview snapshot store budget. The store is one JSON file rewritten in
+	// full on every save, so both its length and its save rate have to be held
+	// down: the cap bounds the file, and the refresh divisor turns repeat
+	// measurements of an unchanged directory into no-ops until the entry is
+	// within 1/8 of the TTL of aging out.
+	overviewCacheMaxEntries  = 1000
+	overviewCacheKeepEntries = 900
+	overviewRefreshDivisor   = 8
+
+	// Worker pool limits. Deliberately conservative: the User Library scan
+	// blocks many goroutines in syscalls on high-fan-out trees (Steam
+	// workshop/temp, browser caches), and each blocked goroutine holds an
+	// OS thread. Exceeding the per-user thread limit on macOS produces a
+	// fatal "runtime: failed to create new OS thread" with no recovery.
+	// Further reduced after #765: System Library (184GB, 261k files) with
+	// deep permission checks can still exhaust threads at previous limits.
+	minWorkers         = 2
+	maxWorkers         = 12
+	cpuMultiplier      = 1
 	openCommandTimeout = 10 * time.Second
+	scanSendTimeout    = 100 * time.Millisecond
+	uiTickInterval     = 100 * time.Millisecond
 )
+
+var overviewDuIgnoreNames = map[string]bool{
+	// iCloud Drive's FileProvider tree can block `du` for tens of seconds even
+	// when most entries are cloud placeholders. Keep the overview responsive;
+	// users can still drill into the folder explicitly when they need it.
+	"Mobile Documents": true,
+}
 
 var foldDirs = map[string]bool{
 	// VCS.
@@ -193,7 +238,6 @@ var defaultSkipDirs = map[string]bool{
 	// Virtualization/Container mounts (NFS, network filesystems).
 	"OrbStack":        true, // OrbStack NFS mounts
 	"Colima":          true, // Colima VM mounts
-	"Parallels":       true, // Parallels Desktop VMs
 	"VMware Fusion":   true, // VMware Fusion VMs
 	"VirtualBox VMs":  true, // VirtualBox VMs
 	"Rancher Desktop": true, // Rancher Desktop mounts
@@ -246,12 +290,13 @@ var skipExtensions = map[string]bool{
 	".hx":     true,
 }
 
-var spinnerFrames = []string{"|", "/", "-", "\\", "|", "/", "-", "\\"}
+// Match the shell spinner's centered 2x2 shape in lib/core/ui.sh.
+var spinnerFrames = []string{"⠖", "⠲", "⠴", "⠦"}
 
 const (
 	colorPurple     = "\033[0;35m"
 	colorPurpleBold = "\033[1;35m"
-	colorGray       = "\033[0;90m"
+	colorGray       = "\033[0;38;5;244m"
 	colorRed        = "\033[0;31m"
 	colorYellow     = "\033[0;33m"
 	colorGreen      = "\033[0;32m"

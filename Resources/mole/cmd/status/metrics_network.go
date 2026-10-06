@@ -16,63 +16,92 @@ import (
 
 var ioCountersFunc = net.IOCounters
 
-func collectIOCountersSafely(pernic bool) (stats []net.IOCountersStat, err error) {
+const (
+	minNetworkSampleInterval = 100 * time.Millisecond
+	networkIPCacheTTL        = 10 * time.Second
+)
+
+var noiseInterfacePrefixes = [...]string{"lo", "awdl", "utun", "llw", "bridge", "gif", "stf", "xhc", "anpi", "ap"}
+
+func collectIOCountersSafely() (stats []net.IOCountersStat, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic collecting network counters: %v", r)
 		}
 	}()
-	return ioCountersFunc(pernic)
+	return ioCountersFunc(true)
 }
 
-func (c *Collector) collectNetwork(now time.Time) ([]NetworkStatus, error) {
-	stats, err := collectIOCountersSafely(true)
+func (c *Collector) primeNetworkCounters(now time.Time) {
+	stats, err := collectIOCountersSafely()
+	if err != nil {
+		return
+	}
+	c.lastNetAt = now
+	for _, s := range stats {
+		c.prevNet[s.Name] = s
+	}
+}
+
+// Only full collection may spawn commands; fast frames reuse the latest route.
+func (c *Collector) collectNetworkFull(now time.Time) []NetworkStatus {
+	c.defaultNetInterface = defaultRouteInterface()
+	return c.collectNetwork(now)
+}
+
+func (c *Collector) collectNetwork(now time.Time) []NetworkStatus {
+	if c.prevNet == nil {
+		c.prevNet = make(map[string]net.IOCountersStat)
+	}
+	if c.rxHistoryBuf == nil {
+		c.rxHistoryBuf = NewRingBuffer(NetworkHistorySize)
+	}
+	if c.txHistoryBuf == nil {
+		c.txHistoryBuf = NewRingBuffer(NetworkHistorySize)
+	}
+
+	stats, err := collectIOCountersSafely()
 	if err != nil {
 		// Some restricted environments can break netstat-backed collectors.
 		// Degrade gracefully to keep status output available.
 		c.rxHistoryBuf.Add(0)
 		c.txHistoryBuf.Add(0)
-		return nil, nil
+		return nil
 	}
 
 	// Map interface IPs.
-	ifAddrs := getInterfaceIPs()
+	ifAddrs := c.getInterfaceIPsCached(now)
+	defaultInterface := c.defaultNetInterface
 
 	if c.lastNetAt.IsZero() {
 		c.lastNetAt = now
 		for _, s := range stats {
 			c.prevNet[s.Name] = s
 		}
-		return nil, nil
 	}
 
 	elapsed := now.Sub(c.lastNetAt).Seconds()
-	if elapsed <= 0 {
-		elapsed = 1
+	if elapsed < minNetworkSampleInterval.Seconds() {
+		elapsed = minNetworkSampleInterval.Seconds()
 	}
 
 	var result []NetworkStatus
 	for _, cur := range stats {
-		if isNoiseInterface(cur.Name) {
+		if (isNoiseInterface(cur.Name) || isTunnelInterface(cur.Name)) && cur.Name != defaultInterface {
 			continue
 		}
 		prev, ok := c.prevNet[cur.Name]
 		if !ok {
 			continue
 		}
-		rx := float64(cur.BytesRecv-prev.BytesRecv) / 1024.0 / 1024.0 / elapsed
-		tx := float64(cur.BytesSent-prev.BytesSent) / 1024.0 / 1024.0 / elapsed
-		if rx < 0 {
-			rx = 0
-		}
-		if tx < 0 {
-			tx = 0
-		}
+		rx := float64(counterDelta(cur.BytesRecv, prev.BytesRecv)) / 1024.0 / 1024.0 / elapsed
+		tx := float64(counterDelta(cur.BytesSent, prev.BytesSent)) / 1024.0 / 1024.0 / elapsed
 		result = append(result, NetworkStatus{
-			Name:      cur.Name,
-			RxRateMBs: rx,
-			TxRateMBs: tx,
-			IP:        ifAddrs[cur.Name],
+			Name:          cur.Name,
+			RxRateMBs:     rx,
+			TxRateMBs:     tx,
+			IP:            ifAddrs[cur.Name],
+			defaultTunnel: cur.Name == defaultInterface && isTunnelInterface(cur.Name),
 		})
 	}
 
@@ -82,23 +111,72 @@ func (c *Collector) collectNetwork(now time.Time) ([]NetworkStatus, error) {
 	}
 
 	sort.Slice(result, func(i, j int) bool {
+		// Keep the routed tunnel visible even when its physical carrier is busier.
+		if result[i].defaultTunnel != result[j].defaultTunnel {
+			return result[i].defaultTunnel
+		}
 		return result[i].RxRateMBs+result[i].TxRateMBs > result[j].RxRateMBs+result[j].TxRateMBs
 	})
 	if len(result) > 3 {
 		result = result[:3]
 	}
 
-	var totalRx, totalTx float64
-	for _, r := range result {
-		totalRx += r.RxRateMBs
-		totalTx += r.TxRateMBs
-	}
+	totalRx, totalTx := networkTotals(result)
 
 	// Update history using the global/aggregated stats
 	c.rxHistoryBuf.Add(totalRx)
 	c.txHistoryBuf.Add(totalTx)
 
-	return result, nil
+	return result
+}
+
+// The IPv4 default route identifies the active tunnel without guessing from
+// cumulative bytes on idle system tunnels. A failed probe keeps physical rates.
+func defaultRouteInterface() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	out, err := runCmd(ctx, "route", "-n", "get", "default")
+	if err != nil {
+		return ""
+	}
+	for line := range strings.Lines(out) {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && key == "interface" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func isTunnelInterface(name string) bool {
+	for _, prefix := range []string{"utun", "tun", "ipsec", "ppp"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// Tunnel and carrier counters describe overlapping traffic. Keep both as
+// interface rows, but use the routed tunnel for the card and history totals.
+func networkTotals(stats []NetworkStatus) (rx, tx float64) {
+	for _, n := range stats {
+		if n.defaultTunnel {
+			return n.RxRateMBs, n.TxRateMBs
+		}
+		rx += n.RxRateMBs
+		tx += n.TxRateMBs
+	}
+	return rx, tx
+}
+
+func (c *Collector) getInterfaceIPsCached(now time.Time) map[string]string {
+	if c.cachedNetIPs != nil && now.Sub(c.lastNetIPAt) < networkIPCacheTTL {
+		return c.cachedNetIPs
+	}
+	c.cachedNetIPs = getInterfaceIPs()
+	c.lastNetIPAt = now
+	return c.cachedNetIPs
 }
 
 func getInterfaceIPs() map[string]string {
@@ -111,7 +189,7 @@ func getInterfaceIPs() map[string]string {
 		for _, addr := range iface.Addrs {
 			// IPv4 only.
 			if strings.Contains(addr.Addr, ".") && !strings.HasPrefix(addr.Addr, "127.") {
-				ip := strings.Split(addr.Addr, "/")[0]
+				ip, _, _ := strings.Cut(addr.Addr, "/")
 				result[iface.Name] = ip
 				break
 			}
@@ -122,8 +200,7 @@ func getInterfaceIPs() map[string]string {
 
 func isNoiseInterface(name string) bool {
 	lower := strings.ToLower(name)
-	noiseList := []string{"lo", "awdl", "utun", "llw", "bridge", "gif", "stf", "xhc", "anpi", "ap"}
-	for _, prefix := range noiseList {
+	for _, prefix := range noiseInterfacePrefixes {
 		if strings.HasPrefix(lower, prefix) {
 			return true
 		}
@@ -230,7 +307,7 @@ func collectProxyFromScutilOutput(out string) ProxyStatus {
 }
 
 func collectProxyFromTunInterfaces() ProxyStatus {
-	stats, err := net.IOCounters(true)
+	stats, err := collectIOCountersSafely()
 	if err != nil {
 		return ProxyStatus{Enabled: false}
 	}
@@ -252,7 +329,14 @@ func collectProxyFromTunInterfaces() ProxyStatus {
 	if len(activeTun) > 1 {
 		host = activeTun[0] + "+"
 	}
-	return ProxyStatus{Enabled: true, Type: "TUN", Host: host}
+	// Reported as a tunnel, never as a proxy. This branch is only reached when
+	// no proxy is configured in the environment or in scutil, which is exactly
+	// the case where an active `utun` is most likely iCloud Private Relay or a
+	// VPN. Calling that "Proxy TUN" told users something false about a machine
+	// that has no proxy at all.
+	// Keep the existing JSON type value for automation consumers. IsTunnel is
+	// the presentation hint that lets the terminal UI use an honest label.
+	return ProxyStatus{Enabled: true, Type: "TUN", Host: host, IsTunnel: true}
 }
 
 func scutilProxyEnabled(out, key string) bool {
