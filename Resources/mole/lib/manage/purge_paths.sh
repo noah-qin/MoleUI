@@ -12,15 +12,13 @@ if [[ -z "${PURGE_TARGETS:-}" ]]; then
     source "$_MOLE_MANAGE_DIR/../clean/project.sh"
 fi
 
-# Config file path (use :- to avoid re-declaration if already set)
-PURGE_PATHS_CONFIG="${PURGE_PATHS_CONFIG:-$HOME/.config/mole/purge_paths}"
+# Config file path (prefer the shared project constant when available)
+PURGE_PATHS_CONFIG="${PURGE_PATHS_CONFIG:-${PURGE_CONFIG_FILE:-$HOME/.config/mole/purge_paths}}"
 
 # Ensure config file exists with helpful template
 ensure_config_template() {
     if [[ ! -f "$PURGE_PATHS_CONFIG" ]]; then
-        ensure_user_dir "$(dirname "$PURGE_PATHS_CONFIG")"
-        cat > "$PURGE_PATHS_CONFIG" << 'EOF'
-# Mole Purge Paths - Directories to scan for project artifacts
+        if ! write_purge_config "# Mole Purge Paths - Directories to scan for project artifacts
 # Add one path per line (supports ~ for home directory)
 # Delete all paths or this file to use defaults
 #
@@ -28,7 +26,9 @@ ensure_config_template() {
 # ~/Documents/MyProjects
 # ~/Work/ClientA
 # ~/Work/ClientB
-EOF
+"; then
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Could not initialize ${PURGE_PATHS_CONFIG/#$HOME/~}" >&2
+        fi
     fi
 }
 

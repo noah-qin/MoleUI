@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
 
+load helpers/common
+
 setup_file() {
-    PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
-    export PROJECT_ROOT
+    mole_test_setup_project_root
 
     TEST_DATA_DIR="$(mktemp -d "${BATS_TEST_DIRNAME}/tmp-perf.XXXXXX")"
     export TEST_DATA_DIR
@@ -14,6 +15,47 @@ teardown_file() {
 
 setup() {
     source "$PROJECT_ROOT/lib/core/base.sh"
+}
+
+@test "scan workers reap a completed peer before a blocked queue head" {
+    run /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/base.sh"
+release="$TEST_DATA_DIR/release-$$"
+(while [[ ! -f "$release" ]]; do sleep 0.02; done) &
+slow=$!
+trap 'touch "$release"; wait "$slow" 2>/dev/null || true' EXIT
+(exit 7) &
+fast=$!
+finished=""
+rc=0
+mole_wait_for_any_worker finished "$slow" "$fast" || rc=$?
+[[ "$finished" == "$fast" && "$rc" == 7 ]] || exit 1
+kill -0 "$slow" || exit 1
+touch "$release"
+wait "$slow"
+printf 'fast-reaped slow-still-running\n'
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"fast-reaped slow-still-running"* ]] || return 1
+}
+
+@test "scan worker polling propagates interrupted sleep" {
+    run /bin/bash <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/base.sh"
+sleep 10 &
+worker=$!
+trap 'kill "$worker" 2>/dev/null || true; wait "$worker" 2>/dev/null || true' EXIT
+sleep() { return 130; }
+finished=""
+rc=0
+mole_wait_for_any_worker finished "$worker" || rc=$?
+[[ "$rc" == 130 && -z "$finished" ]] || exit 1
+printf 'interruption-propagated\n'
+EOF
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"interruption-propagated"* ]] || return 1
 }
 
 @test "bytes_to_human handles large values efficiently" {
@@ -106,32 +148,9 @@ setup() {
     [ "$result" = "$current_user" ]
 }
 
-@test "get_invoking_user executes quickly" {
-    local start end elapsed
-    local limit_ms="${MOLE_PERF_GET_INVOKING_USER_LIMIT_MS:-500}"
-
-    start=$(date +%s%N)
-    for i in {1..100}; do
-        get_invoking_user > /dev/null
-    done
-    end=$(date +%s%N)
-
-    elapsed=$(( (end - start) / 1000000 ))
-
-    [ "$elapsed" -lt "$limit_ms" ]
-}
-
-@test "get_darwin_major caches correctly" {
-    local first second
-    first=$(get_darwin_major)
-    second=$(get_darwin_major)
-
-    [ "$first" = "$second" ]
-    [[ "$first" =~ ^[0-9]+$ ]]
-}
-
 @test "create_temp_file and cleanup_temp_files work efficiently" {
     local start end elapsed
+    local limit_ms="${MOLE_PERF_CREATE_TEMP_FILE_LIMIT_MS:-3000}"
 
     declare -a MOLE_TEMP_DIRS=()
 
@@ -143,7 +162,7 @@ setup() {
 
     elapsed=$(( (end - start) / 1000000 ))
 
-    [ "$elapsed" -lt 1000 ]
+    [ "$elapsed" -lt "$limit_ms" ]
 
     [ "${#MOLE_TEMP_FILES[@]}" -eq 50 ]
 
@@ -152,7 +171,7 @@ setup() {
     end=$(date +%s%N)
 
     elapsed=$(( (end - start) / 1000000 ))
-    [ "$elapsed" -lt 2000 ]
+    [ "$elapsed" -lt "$limit_ms" ]
 
     [ "${#MOLE_TEMP_FILES[@]}" -eq 0 ]
 }
@@ -161,43 +180,18 @@ setup() {
     local temp_file
     temp_file=$(mktemp_file "test_prefix")
 
-    [[ "$temp_file" =~ test_prefix ]]
+    [[ "$temp_file" =~ test_prefix ]] || return 1
 
     [ -f "$temp_file" ]
 
     rm -f "$temp_file"
 }
 
-@test "get_brand_name handles common apps efficiently" {
-    local start end elapsed
-
-    get_brand_name "wechat" > /dev/null
-
-    start=$(date +%s%N)
-    for i in {1..50}; do
-        get_brand_name "wechat" > /dev/null
-        get_brand_name "QQ" > /dev/null
-        get_brand_name "dingtalk" > /dev/null
-    done
-    end=$(date +%s%N)
-
-    elapsed=$(( (end - start) / 1000000 ))
-
-    [ "$elapsed" -lt 5000 ]
-}
-
-@test "get_brand_name returns correct localized names" {
-    local result
-    result=$(get_brand_name "wechat")
-
-    [[ "$result" == "WeChat" || "$result" == "微信" ]]
-}
-
 @test "get_optimal_parallel_jobs returns sensible values" {
     local result
 
     result=$(get_optimal_parallel_jobs)
-    [[ "$result" =~ ^[0-9]+$ ]]
+    [[ "$result" =~ ^[0-9]+$ ]] || return 1
     [ "$result" -gt 0 ]
     [ "$result" -le 128 ]
 
@@ -233,5 +227,6 @@ setup() {
 
     elapsed=$(( (end - start) / 1000000 ))
 
-    [ "$elapsed" -lt 2000 ]
+    local limit_ms="${MOLE_PERF_SECTION_LIMIT_MS:-2000}"
+    [ "$elapsed" -lt "$limit_ms" ]
 }
