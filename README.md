@@ -1,6 +1,11 @@
 # Mole UI
 
-> **⚠️ Early Development** — This project is in active development and has not been extensively tested. Use Dry Run mode for cleanup operations and please [report any issues](https://github.com/imnotnoahhh/MoleUI/issues).
+> [!WARNING]
+> **MoleUI is archived and no longer maintained.**
+>
+> MoleUI was an unofficial community GUI for the [Mole](https://github.com/tw93/Mole) CLI. Mole now has an official native app: please use **[Mole for Mac](https://mole.fit/)** instead.
+>
+> The last release, v0.1.5, bundles the Mole CLI from March 2026 and is not compatible with current Mole releases. The code stays available under the MIT license.
 
 Native macOS GUI for [Mole](https://github.com/tw93/Mole). Built with SwiftUI, with Mole Go+Shell as the core kernel.
 
